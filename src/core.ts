@@ -1,5 +1,12 @@
-import { Client } from "./opencode";
-import { EventBus, OcEvent } from "./events";
+import type { Client } from "./opencode";
+import { EventBus, type OcEvent } from "./events";
+import type { components } from "./api";
+import type { ChatState } from "./state";
+
+type AgentInfo = components["schemas"]["Agent.Info"];
+type ModelInfo = components["schemas"]["Model.Info"];
+type ModelRef = components["schemas"]["Model.Ref"];
+type CommandInfo = components["schemas"]["Command.Info"];
 
 export interface PermissionReq {
   id: string;
@@ -17,11 +24,6 @@ export interface CoreHandlers {
   onError: (chatId: number, text: string) => void;
 }
 
-interface ChatStateLite {
-  sessionID?: string;
-  projectDir: string;
-}
-
 export class Core {
   sessionChat = new Map<string, number>();
   private busySessions = new Set<string>();
@@ -31,8 +33,8 @@ export class Core {
   constructor(
     private client: Client,
     private events: EventBus,
-    public getState: (chatId: number) => ChatStateLite,
-    public setState: (chatId: number, s: ChatStateLite) => void,
+    public getState: (chatId: number) => ChatState,
+    public setState: (chatId: number, s: ChatState) => void,
     private handlersInit: CoreHandlers,
   ) {
     this.handlers = handlersInit;
@@ -42,6 +44,13 @@ export class Core {
 
   setHandlers(h: CoreHandlers) {
     this.handlers = h;
+  }
+
+  restoreSessions(chatIds: Iterable<number>): void {
+    for (const chatId of chatIds) {
+      const sessionID = this.getState(chatId).sessionID;
+      if (sessionID) this.sessionChat.set(sessionID, chatId);
+    }
   }
 
   attach() {
@@ -151,26 +160,164 @@ export class Core {
       this.sessionChat.set(st.sessionID, chatId);
       return st.sessionID;
     }
-    const created = await this.client.POST("/api/session", {
-      body: { title: `tg-${chatId}`, location: { directory: st.projectDir } } as any,
-    });
-    const data = (created.data as any)?.data ?? created.data;
-    if (!data?.id) throw new Error(`session create failed: ${JSON.stringify(created.error)}`);
-    this.setState(chatId, { ...st, sessionID: data.id });
-    this.sessionChat.set(data.id, chatId);
-    return data.id;
+    return this.createSession(chatId, st);
   }
 
   async newSession(chatId: number): Promise<string> {
     const st = this.getState(chatId);
+    return this.createSession(chatId, st);
+  }
+
+  private async createSession(chatId: number, state: ChatState): Promise<string> {
     const created = await this.client.POST("/api/session", {
-      body: { title: `tg-${chatId}`, location: { directory: st.projectDir } } as any,
+      body: {
+        title: `tg-${chatId}`,
+        location: { directory: state.projectDir },
+        ...(state.agent ? { agent: state.agent } : {}),
+        ...(state.model ? { model: state.model } : {}),
+      },
     });
-    const data = (created.data as any)?.data ?? created.data;
-    if (!data?.id) throw new Error(`session create failed: ${JSON.stringify(created.error)}`);
-    this.setState(chatId, { ...st, sessionID: data.id });
-    this.sessionChat.set(data.id, chatId);
-    return data.id;
+    if (created.error || !created.data?.data) {
+      throw new Error(`session create failed: ${JSON.stringify(created.error)}`);
+    }
+    const sessionID = created.data.data.id;
+    this.setState(chatId, { ...state, sessionID });
+    this.sessionChat.set(sessionID, chatId);
+    return sessionID;
+  }
+
+  async listAgents(chatId: number): Promise<AgentInfo[]> {
+    const state = this.getState(chatId);
+    const response = await this.client.GET("/api/agent", {
+      params: { query: { location: { directory: state.projectDir } } },
+    });
+    return response.data?.data ?? [];
+  }
+
+  async listModels(chatId: number): Promise<ModelInfo[]> {
+    const state = this.getState(chatId);
+    const response = await this.client.GET("/api/model", {
+      params: { query: { location: { directory: state.projectDir } } },
+    });
+    return response.data?.data ?? [];
+  }
+
+  async listCommands(chatId: number): Promise<CommandInfo[]> {
+    const state = this.getState(chatId);
+    const response = await this.client.GET("/api/command", {
+      params: { query: { location: { directory: state.projectDir } } },
+    });
+    return response.data?.data ?? [];
+  }
+
+  async setAgent(chatId: number, agent: string): Promise<boolean> {
+    const sessionID = await this.ensureSession(chatId);
+    const response = await this.client.POST("/api/session/{sessionID}/agent", {
+      params: { path: { sessionID } },
+      body: { agent },
+    });
+    if (response.error) return false;
+    this.setState(chatId, { ...this.getState(chatId), agent });
+    return true;
+  }
+
+  async setModel(chatId: number, model: ModelRef): Promise<boolean> {
+    const sessionID = await this.ensureSession(chatId);
+    const response = await this.client.POST("/api/session/{sessionID}/model", {
+      params: { path: { sessionID } },
+      body: { model },
+    });
+    if (response.error) return false;
+    this.setState(chatId, { ...this.getState(chatId), model });
+    return true;
+  }
+
+  async openSession(chatId: number, sessionID: string): Promise<boolean> {
+    const response = await this.client.GET("/api/session/{sessionID}", {
+      params: { path: { sessionID } },
+    });
+    const session = response.data?.data;
+    if (response.error || !session) return false;
+    this.setState(chatId, {
+      ...this.getState(chatId),
+      sessionID,
+      projectDir: session.location.directory,
+      agent: session.agent,
+      model: session.model,
+    });
+    this.sessionChat.set(sessionID, chatId);
+    return true;
+  }
+
+  async compact(chatId: number): Promise<boolean> {
+    const sessionID = this.getState(chatId).sessionID;
+    if (!sessionID) return false;
+    const response = await this.client.POST("/api/session/{sessionID}/compact", {
+      params: { path: { sessionID } },
+      body: {},
+    });
+    return !response.error;
+  }
+
+  async runCommand(chatId: number, name: string, text: string): Promise<"completed" | "busy" | "failed"> {
+    const sessionID = await this.ensureSession(chatId);
+    if (this.busySessions.has(sessionID)) return "busy";
+    this.busySessions.add(sessionID);
+    try {
+      const done = this.waitForExecution(sessionID);
+      this.lastText.delete(sessionID);
+      try {
+        const response = await this.client.POST("/api/session/{sessionID}/command", {
+          params: { path: { sessionID } },
+          body: { name, text },
+        });
+        if (response.error) {
+          this.cancelExecution(sessionID);
+          this.handlers.onError(chatId, `command failed: ${JSON.stringify(response.error).slice(0, 300)}`);
+          return "failed";
+        }
+        const succeeded = await done;
+        if (!succeeded) {
+          this.handlers.onError(chatId, "command execution timed out or failed");
+          return "failed";
+        }
+        this.handlers.onDone(chatId, this.lastText.get(sessionID) ?? `/${name} completed.`);
+        return "completed";
+      } catch (error) {
+        this.cancelExecution(sessionID);
+        if (!(error instanceof Error)) throw error;
+        this.handlers.onError(chatId, `command failed: ${error.message}`);
+        return "failed";
+      }
+    } finally {
+      this.busySessions.delete(sessionID);
+      this.drainPromptQueue(chatId, sessionID);
+    }
+  }
+
+  private waitForExecution(sessionID: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingExecution.delete(sessionID);
+        resolve(false);
+      }, 10 * 60 * 1000);
+      this.pendingExecution.set(sessionID, { resolve, timer });
+    });
+  }
+
+  private cancelExecution(sessionID: string): void {
+    const pending = this.pendingExecution.get(sessionID);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingExecution.delete(sessionID);
+    pending.resolve(false);
+  }
+
+  private drainPromptQueue(chatId: number, sessionID: string): void {
+    const next = (this.queues.get(sessionID) ?? []).shift();
+    if (!next) return;
+    this.queues.set(sessionID, this.queues.get(sessionID) ?? []);
+    void this.sendPrompt(chatId, next);
   }
 
   async sendPrompt(chatId: number, text: string): Promise<string | null> {
@@ -188,13 +335,7 @@ export class Core {
       await this.runPrompt(sessionID, chatId, text);
     } finally {
       this.busySessions.delete(sessionID);
-      const next = (this.queues.get(sessionID) ?? []).shift();
-      if (next) {
-        const rest = this.queues.get(sessionID) ?? [];
-        this.queues.set(sessionID, rest);
-        // run next without blocking caller
-        void this.sendPrompt(chatId, next);
-      }
+      this.drainPromptQueue(chatId, sessionID);
     }
     return null;
   }
@@ -257,7 +398,7 @@ export class Core {
 
   setProject(chatId: number, projectDir: string) {
     const st = this.getState(chatId);
-    this.setState(chatId, { ...st, projectDir, sessionID: undefined });
+    this.setState(chatId, { projectDir });
   }
 
   listProjects(allowlist: string[]) {
@@ -265,25 +406,24 @@ export class Core {
   }
 
   async listSessions(_chatId: number) {
-    const res = await this.client.GET("/api/session");
-    return (res.data as any)?.data ?? res.data ?? [];
+    const state = this.getState(_chatId);
+    const res = await this.client.GET("/api/session", {
+      params: { query: { directory: state.projectDir, limit: "50", order: "desc" } },
+    });
+    return res.data?.data ?? [];
   }
 
-  async listModels() {
-    const res = await this.client.GET("/api/model");
-    return (res.data as any)?.data ?? res.data ?? [];
-  }
-
-  async getPendingPermissions(): Promise<PermissionReq[]> {
+  async getPendingPermissions(chatId?: number): Promise<PermissionReq[]> {
     const res = await this.client.GET("/api/permission/request");
     const list = (res.data as any)?.data ?? res.data ?? [];
-    return (Array.isArray(list) ? list : []).map((d: any) => ({
+    const requests: PermissionReq[] = (Array.isArray(list) ? list : []).map((d: any) => ({
       id: d.id,
       sessionID: d.sessionID,
       action: d.action,
       resources: d.resources ?? [],
       message: d.message,
     }));
+    return chatId === undefined ? requests : requests.filter((request) => this.sessionChat.get(request.sessionID) === chatId);
   }
 }
 

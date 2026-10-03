@@ -16,15 +16,21 @@ async function main() {
     `${config.opencodeUrl}/api/event`,
     "Basic " + Buffer.from(`${config.opencodeUser}:${config.opencodePassword}`).toString("base64"),
   );
-  const state = new State();
+  const state = new State(config.statePath);
   const core = new Core(
     client,
     events,
     (chatId) => state.get(chatId, config.defaultProject),
     (chatId, s) => state.set(chatId, s),
-    {} as any, // handlers assigned by makeBot
+    {
+      onPermission: () => {},
+      onProgress: () => {},
+      onDone: () => {},
+      onError: () => {},
+    },
   );
-  const bot = makeBot(config, core);
+  core.restoreSessions(config.allowedIds);
+  const bot = await makeBot(config, core);
   core.attach();
   events.start();
 

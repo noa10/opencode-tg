@@ -1,17 +1,34 @@
 // Step 0 smoke test: create a session, send a prompt, list messages.
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { makeClient } from "../src/opencode";
 
-function servicePassword(): string {
-  const raw = JSON.parse(readFileSync("/home/ubuntu/.config/opencode/service.json", "utf8"));
-  return raw.password;
+function loadOpenCodeConfig(): { readonly url: string; readonly user: string; readonly password: string } {
+  const envPath = process.env.TG_ENV ?? resolve(homedir(), ".config/opencode-tg/env");
+  const env: Record<string, string> = {};
+  for (const line of readFileSync(envPath, "utf8").split("\n")) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+    if (match?.[1] && match[2] !== undefined) env[match[1]] = match[2];
+  }
+  const servicePath = env.OPENCODE_SERVICE_FILE ?? resolve(homedir(), ".config/opencode/service.json");
+  const serviceConfig: unknown = JSON.parse(readFileSync(servicePath, "utf8"));
+  if (typeof serviceConfig !== "object" || serviceConfig === null || !("password" in serviceConfig) || typeof serviceConfig.password !== "string") {
+    throw new Error(`OpenCode service config at ${servicePath} must contain a string password`);
+  }
+  return {
+    url: env.OPENCODE_URL ?? "http://127.0.0.1:49374",
+    user: env.OPENCODE_USER ?? "opencode",
+    password: serviceConfig.password,
+  };
 }
 
 async function main() {
+  const config = loadOpenCodeConfig();
   const client = makeClient({
-    url: "http://127.0.0.1:49374",
-    user: "opencode",
-    password: servicePassword(),
+    url: config.url,
+    user: config.user,
+    password: config.password,
   });
 
   const info = await client.GET("/api/info");
