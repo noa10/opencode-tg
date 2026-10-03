@@ -14,7 +14,6 @@ export interface PermissionReq {
   action: string;
   resources: string[];
   message?: string;
-  chatId?: number;
 }
 
 export interface CoreHandlers {
@@ -29,6 +28,8 @@ export class Core {
   private busySessions = new Set<string>();
   private queues = new Map<string, string[]>(); // sessionID -> queued prompts
   private pendingExecution = new Map<string, { resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>();
+  private validatedSessions = new Set<string>();
+  private sessionInitializations = new Map<number, Map<string, Promise<string>>>();
 
   constructor(
     private client: Client,
@@ -105,7 +106,6 @@ export class Core {
       for (const req of pending) {
         const chatId = this.sessionChat.get(req.sessionID);
         if (chatId != null) {
-          req.chatId = chatId;
           this.handlers.onPermission(chatId, req);
         }
       }
@@ -140,7 +140,6 @@ export class Core {
       console.log(`[permission.asked] no chat for session ${req.sessionID}, leaving pending in web UI`);
       return;
     }
-    req.chatId = chatId;
     this.handlers.onPermission(chatId, req);
   }
 
@@ -155,10 +154,49 @@ export class Core {
   }
 
   async ensureSession(chatId: number): Promise<string> {
+    const projectDir = this.getState(chatId).projectDir;
+    let initializations = this.sessionInitializations.get(chatId);
+    const pending = initializations?.get(projectDir);
+    if (pending) return pending;
+    const initialization = this.ensureSessionReady(chatId);
+    if (!initializations) {
+      initializations = new Map<string, Promise<string>>();
+      this.sessionInitializations.set(chatId, initializations);
+    }
+    initializations.set(projectDir, initialization);
+    try {
+      return await initialization;
+    } finally {
+      if (initializations.get(projectDir) === initialization) initializations.delete(projectDir);
+      if (initializations.size === 0) this.sessionInitializations.delete(chatId);
+    }
+  }
+
+  private async ensureSessionReady(chatId: number): Promise<string> {
     const st = this.getState(chatId);
     if (st.sessionID) {
-      this.sessionChat.set(st.sessionID, chatId);
-      return st.sessionID;
+      if (this.validatedSessions.has(st.sessionID)) {
+        this.sessionChat.set(st.sessionID, chatId);
+        return st.sessionID;
+      }
+      const existing = await this.client.GET("/api/session/{sessionID}", {
+        params: { path: { sessionID: st.sessionID } },
+      });
+      if (!existing.error && existing.data?.data) {
+        this.validatedSessions.add(st.sessionID);
+        this.sessionChat.set(st.sessionID, chatId);
+        return st.sessionID;
+      }
+      if (existing.response.status !== 404) {
+        throw new Error(`session lookup failed: ${JSON.stringify(existing.error)}`);
+      }
+      this.sessionChat.delete(st.sessionID);
+      const recovered = { ...st, sessionID: undefined };
+      const current = this.getState(chatId);
+      if (current.projectDir === st.projectDir && current.sessionID === st.sessionID) {
+        this.setState(chatId, recovered);
+      }
+      return this.createSession(chatId, recovered);
     }
     return this.createSession(chatId, st);
   }
@@ -181,8 +219,12 @@ export class Core {
       throw new Error(`session create failed: ${JSON.stringify(created.error)}`);
     }
     const sessionID = created.data.data.id;
-    this.setState(chatId, { ...state, sessionID });
+    const current = this.getState(chatId);
+    if (current.projectDir === state.projectDir && current.sessionID === state.sessionID) {
+      this.setState(chatId, { ...current, sessionID });
+    }
     this.sessionChat.set(sessionID, chatId);
+    this.validatedSessions.add(sessionID);
     return sessionID;
   }
 
@@ -191,6 +233,7 @@ export class Core {
     const response = await this.client.GET("/api/agent", {
       params: { query: { location: { directory: state.projectDir } } },
     });
+    if (response.error) throw new Error(`agent list failed: ${JSON.stringify(response.error)}`);
     return response.data?.data ?? [];
   }
 
@@ -199,6 +242,7 @@ export class Core {
     const response = await this.client.GET("/api/model", {
       params: { query: { location: { directory: state.projectDir } } },
     });
+    if (response.error) throw new Error(`model list failed: ${JSON.stringify(response.error)}`);
     return response.data?.data ?? [];
   }
 
@@ -207,6 +251,7 @@ export class Core {
     const response = await this.client.GET("/api/command", {
       params: { query: { location: { directory: state.projectDir } } },
     });
+    if (response.error) throw new Error(`command list failed: ${JSON.stringify(response.error)}`);
     return response.data?.data ?? [];
   }
 
@@ -232,12 +277,12 @@ export class Core {
     return true;
   }
 
-  async openSession(chatId: number, sessionID: string): Promise<boolean> {
+  async openSession(chatId: number, sessionID: string, allowedDirectories: readonly string[]): Promise<boolean> {
     const response = await this.client.GET("/api/session/{sessionID}", {
       params: { path: { sessionID } },
     });
     const session = response.data?.data;
-    if (response.error || !session) return false;
+    if (response.error || !session || !allowedDirectories.includes(session.location.directory)) return false;
     this.setState(chatId, {
       ...this.getState(chatId),
       sessionID,
@@ -246,6 +291,7 @@ export class Core {
       model: session.model,
     });
     this.sessionChat.set(sessionID, chatId);
+    this.validatedSessions.add(sessionID);
     return true;
   }
 
@@ -314,9 +360,13 @@ export class Core {
   }
 
   private drainPromptQueue(chatId: number, sessionID: string): void {
-    const next = (this.queues.get(sessionID) ?? []).shift();
-    if (!next) return;
-    this.queues.set(sessionID, this.queues.get(sessionID) ?? []);
+    const queue = this.queues.get(sessionID);
+    const next = queue?.shift();
+    if (!next) {
+      this.queues.delete(sessionID);
+      return;
+    }
+    if (!queue?.length) this.queues.delete(sessionID);
     void this.sendPrompt(chatId, next);
   }
 
@@ -410,6 +460,7 @@ export class Core {
     const res = await this.client.GET("/api/session", {
       params: { query: { directory: state.projectDir, limit: "50", order: "desc" } },
     });
+    if (res.error) throw new Error(`session list failed: ${JSON.stringify(res.error)}`);
     return res.data?.data ?? [];
   }
 

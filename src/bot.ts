@@ -1,4 +1,5 @@
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { randomBytes } from "node:crypto";
+import { Bot, GrammyError, InlineKeyboard, type Context } from "grammy";
 import type { components } from "./api";
 import type { Config } from "./config";
 import { Core, type PermissionReq } from "./core";
@@ -12,7 +13,7 @@ type MenuAction =
   | { readonly kind: "agents" }
   | { readonly kind: "select-agent"; readonly agent: string }
   | { readonly kind: "models"; readonly page: number }
-  | { readonly kind: "model-variants"; readonly id: string; readonly providerID: string }
+  | { readonly kind: "model-variants"; readonly id: string; readonly providerID: string; readonly page: number }
   | { readonly kind: "select-model"; readonly model: ModelRef }
   | { readonly kind: "projects" }
   | { readonly kind: "select-project"; readonly directory: string }
@@ -20,7 +21,7 @@ type MenuAction =
   | { readonly kind: "open-session"; readonly sessionID: string }
   | { readonly kind: "new-session" }
   | { readonly kind: "commands" }
-  | { readonly kind: "run-command"; readonly name: string; readonly text: string }
+  | { readonly kind: "run-command"; readonly name: string }
   | { readonly kind: "command-args"; readonly name: string }
   | { readonly kind: "compact" }
   | { readonly kind: "interrupt" };
@@ -31,12 +32,19 @@ type MenuScreen = {
 };
 
 type PendingPermission = {
+  readonly chatId: number;
   readonly request: PermissionReq;
+  readonly timer: NodeJS.Timeout;
+};
+
+type PendingCommand = {
+  readonly name: string;
   readonly timer: NodeJS.Timeout;
 };
 
 const PERMISSION_TTL_MS = 5 * 60 * 1000;
 const MENU_ACTION_TTL_MS = 5 * 60 * 1000;
+const PENDING_COMMAND_TTL_MS = 5 * 60 * 1000;
 const FRESH_MS = 120_000;
 const PAGE_SIZE = 8;
 
@@ -49,7 +57,8 @@ function isPermissionDecision(value: string): value is PermissionDecision {
 }
 
 function buttonLabel(value: string, max = 48): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  const characters = Array.from(value);
+  return characters.length > max ? `${characters.slice(0, max - 1).join("")}…` : value;
 }
 
 export async function makeBot(config: Config, core: Core, telegramApiFetch?: typeof fetch) {
@@ -70,16 +79,66 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
 
   const permissionMap = new Map<string, PendingPermission>();
   const menuActions = new Map<string, { readonly chatId: number; readonly action: MenuAction; readonly timer: NodeJS.Timeout }>();
-  const pendingCommands = new Map<number, string>();
-  let permissionCounter = 0;
-  let menuActionCounter = 0;
+  const inFlightMenuActions = new Set<string>();
+  const pendingCommands = new Map<number, PendingCommand>();
 
   function actionData(chatId: number, action: MenuAction): string {
-    const key = `m${++menuActionCounter}`;
+    let key: string;
+    do {
+      key = `m${randomBytes(6).toString("base64url")}`;
+    } while (menuActions.has(key));
     const timer = setTimeout(() => menuActions.delete(key), MENU_ACTION_TTL_MS);
     timer.unref();
     menuActions.set(key, { chatId, action, timer });
     return key;
+  }
+
+  function setPendingCommand(chatId: number, name: string): void {
+    const previous = pendingCommands.get(chatId);
+    if (previous) clearTimeout(previous.timer);
+    const pending: PendingCommand = {
+      name,
+      timer: setTimeout(() => {
+        if (pendingCommands.get(chatId) !== pending) return;
+        pendingCommands.delete(chatId);
+        void bot.api.sendMessage(chatId, `The argument prompt for /${name} expired. Open /commands to try again.`)
+          .catch((error: unknown) => console.error("argument timeout notice failed", error));
+      }, PENDING_COMMAND_TTL_MS),
+    };
+    pending.timer.unref();
+    pendingCommands.set(chatId, pending);
+  }
+
+  function clearPendingCommand(chatId: number): string | undefined {
+    const pending = pendingCommands.get(chatId);
+    if (!pending) return undefined;
+    clearTimeout(pending.timer);
+    pendingCommands.delete(chatId);
+    return pending.name;
+  }
+
+  function startCommand(chatId: number, name: string, text: string): void {
+    void core.runCommand(chatId, name, text).then((result) => {
+      if (result === "busy") {
+        return bot.api.sendMessage(chatId, "The session is busy. Try the command again when it finishes.");
+      }
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return bot.api.sendMessage(chatId, `⚠️ ${escapeHtml(redact(message))}`, { parse_mode: "HTML" })
+        .catch((sendError: unknown) => console.error("command failure notice failed", sendError));
+    });
+  }
+
+  function startPrompt(chatId: number, text: string): void {
+    void core.sendPrompt(chatId, text).then((result) => {
+      if (result === "queued") {
+        return bot.api.sendMessage(chatId, "⏳ Still working on the previous prompt; yours is queued.");
+      }
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return bot.api.sendMessage(chatId, `⚠️ ${escapeHtml(redact(message))}`, { parse_mode: "HTML" })
+        .catch((sendError: unknown) => console.error("prompt failure notice failed", sendError));
+    });
   }
 
   const progressMsg = new Map<number, { messageId: number; lastEdit: number }>();
@@ -103,7 +162,10 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
 
   core.setHandlers({
     onPermission: (chatId, request) => {
-      const key = `p${++permissionCounter}`;
+      let key: string;
+      do {
+        key = `p${randomBytes(6).toString("base64url")}`;
+      } while (permissionMap.has(key));
       const keyboard = new InlineKeyboard()
         .text("Allow once", `${key}:once`)
         .text("Reject", `${key}:reject`)
@@ -131,7 +193,8 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         const notice = accepted ? "Permission timed out and was rejected." : "Permission timed out; rejection could not be sent.";
         await bot.api.sendMessage(chatId, `⏰ ${notice}`).catch((error: unknown) => console.error("permission timeout notice failed", error));
       }, PERMISSION_TTL_MS);
-      permissionMap.set(key, { request, timer });
+      timer.unref();
+      permissionMap.set(key, { chatId, request, timer });
     },
     onProgress: throttleProgress,
     onDone: async (chatId, text) => {
@@ -212,6 +275,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         kind: "model-variants",
         id: model.id,
         providerID: model.providerID,
+        page: currentPage,
       })).row();
     }
     if (pageCount > 1) {
@@ -226,9 +290,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     return { text, keyboard };
   }
 
-  async function modelVariantScreen(chatId: number, id: string, providerID: string): Promise<MenuScreen> {
+  async function modelVariantScreen(chatId: number, id: string, providerID: string, page: number): Promise<MenuScreen> {
     const model = (await core.listModels(chatId)).find((item) => item.id === id && item.providerID === providerID);
-    if (!model) return modelScreen(chatId, 0);
+    if (!model) return modelScreen(chatId, page);
     const keyboard = new InlineKeyboard().text("Default variant", actionData(chatId, {
       kind: "select-model",
       model: { id: model.id, providerID: model.providerID },
@@ -239,7 +303,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         model: { id: model.id, providerID: model.providerID, variant: variant.id },
       })).row();
     }
-    keyboard.text("Back to models", actionData(chatId, { kind: "models", page: 0 }));
+    keyboard.text("Back to models", actionData(chatId, { kind: "models", page }));
     return { text: `<b>${escapeHtml(model.name)}</b>\nChoose the default settings or a model variant.`, keyboard };
   }
 
@@ -251,7 +315,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       keyboard.text(buttonLabel(`${marker}${directory}`), actionData(chatId, { kind: "select-project", directory })).row();
     }
     keyboard.text("Back", actionData(chatId, { kind: "home" }));
-    return { text: "<b>Choose an allowed project</b>\nChanging project starts a new session and clears project-specific agent and model selections.", keyboard };
+    return { text: "<b>Choose an allowed project</b>\nChanging projects clears the active agent and model selections. The next message starts a new session.", keyboard };
   }
 
   async function sessionScreen(chatId: number, page: number): Promise<MenuScreen> {
@@ -266,6 +330,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       keyboard.text(buttonLabel(`${marker}${title}`), actionData(chatId, { kind: "open-session", sessionID: session.id })).row();
     }
     keyboard.text("New session", actionData(chatId, { kind: "new-session" }));
+    keyboard.row();
     if (pageCount > 1) {
       if (currentPage > 0) keyboard.text("‹ Previous", actionData(chatId, { kind: "sessions", page: currentPage - 1 }));
       if (currentPage < pageCount - 1) keyboard.text("Next ›", actionData(chatId, { kind: "sessions", page: currentPage + 1 }));
@@ -288,7 +353,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     const keyboard = new InlineKeyboard();
     for (const command of commands) {
       keyboard
-        .text(buttonLabel(`/${command.name}`), actionData(chatId, { kind: "run-command", name: command.name, text: "" }))
+        .text(buttonLabel(`/${command.name}`), actionData(chatId, { kind: "run-command", name: command.name }))
         .text("Args", actionData(chatId, { kind: "command-args", name: command.name }))
         .row();
     }
@@ -303,7 +368,12 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
   }
 
   async function editScreen(ctx: Context, screen: MenuScreen): Promise<void> {
-    await ctx.editMessageText(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
+    try {
+      await ctx.editMessageText(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
+    } catch (error) {
+      if (error instanceof GrammyError && error.description === "Bad Request: message is not modified") return;
+      throw error;
+    }
   }
 
   async function showHome(ctx: Context, chatId: number, notice?: string): Promise<void> {
@@ -327,7 +397,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         await editScreen(ctx, await modelScreen(chatId, action.page));
         return;
       case "model-variants":
-        await editScreen(ctx, await modelVariantScreen(chatId, action.id, action.providerID));
+        await editScreen(ctx, await modelVariantScreen(chatId, action.id, action.providerID, action.page));
         return;
       case "select-model": {
         const selected = await core.setModel(chatId, action.model);
@@ -340,13 +410,13 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         return;
       case "select-project":
         core.setProject(chatId, action.directory);
-        await showHome(ctx, chatId, `Project changed to ${action.directory}. Start a new session to continue.`);
+        await showHome(ctx, chatId, `Project changed to ${action.directory}. Your next message starts a new session there.`);
         return;
       case "sessions":
         await editScreen(ctx, await sessionScreen(chatId, action.page));
         return;
       case "open-session": {
-        const opened = await core.openSession(chatId, action.sessionID);
+        const opened = await core.openSession(chatId, action.sessionID, config.projectAllowlist);
         await showHome(ctx, chatId, opened ? `Switched to session ${action.sessionID}.` : "OpenCode could not open that session.");
         return;
       }
@@ -359,17 +429,12 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         await editScreen(ctx, await commandScreen(chatId));
         return;
       case "run-command": {
-        const result = await core.runCommand(chatId, action.name, action.text);
-        const notice = result === "completed"
-          ? `/${action.name} completed.`
-          : result === "busy"
-            ? "The session is busy. Try the command again when it finishes."
-            : `/${action.name} did not complete.`;
-        await showHome(ctx, chatId, notice);
+        startCommand(chatId, action.name, "");
+        await showHome(ctx, chatId, `/${action.name} started.`);
         return;
       }
       case "command-args":
-        pendingCommands.set(chatId, action.name);
+        setPendingCommand(chatId, action.name);
         await ctx.reply(`Send arguments for /${action.name}. Use /cancel to stop.`, {
           reply_markup: { force_reply: true, selective: true },
         });
@@ -398,15 +463,22 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         await ctx.answerCallbackQuery({ text: "This menu belongs to another chat." });
         return;
       }
-      menuActions.delete(data);
-      clearTimeout(menuAction.timer);
-      await ctx.answerCallbackQuery();
+      if (inFlightMenuActions.has(data)) {
+        await ctx.answerCallbackQuery({ text: "This action is still running." });
+        return;
+      }
+      inFlightMenuActions.add(data);
       try {
+        await ctx.answerCallbackQuery();
         await handleMenuAction(ctx, chatId, menuAction.action);
+        menuActions.delete(data);
+        clearTimeout(menuAction.timer);
       } catch (error) {
         if (!(error instanceof Error)) throw error;
         console.error("menu action failed", error);
         await ctx.reply(`⚠️ ${escapeHtml(redact(error.message))}`, { parse_mode: "HTML" });
+      } finally {
+        inFlightMenuActions.delete(data);
       }
       return;
     }
@@ -415,7 +487,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       return;
     }
 
-    const match = data.match(/^(p\d+):(once|always|reject)$/);
+    const match = data.match(/^(p[A-Za-z0-9_-]+):(once|always|reject)$/);
     if (!match) {
       await ctx.answerCallbackQuery();
       return;
@@ -430,7 +502,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       await ctx.answerCallbackQuery({ text: "Already handled or expired" });
       return;
     }
-    if (pending.request.chatId !== undefined && pending.request.chatId !== ctx.chat?.id) {
+    if (pending.chatId !== ctx.chat?.id) {
       await ctx.answerCallbackQuery({ text: "This permission belongs to another chat." });
       return;
     }
@@ -456,19 +528,21 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
   bot.on("message:text", async (ctx, next) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
-    const commandName = pendingCommands.get(chatId);
+    const commandEntity = ctx.message.entities?.find((entity) => entity.type === "bot_command" && entity.offset === 0);
+    if (commandEntity) {
+      const command = ctx.message.text.slice(0, commandEntity.length).split("@", 1)[0]?.toLowerCase();
+      if (command !== "/cancel") clearPendingCommand(chatId);
+      await next();
+      return;
+    }
+    const commandName = clearPendingCommand(chatId);
     if (!commandName) {
       await next();
       return;
     }
-    pendingCommands.delete(chatId);
     const text = ctx.message.text.trim();
-    if (text === "/cancel") {
-      await ctx.reply("Command cancelled.");
-      return;
-    }
-    const result = await core.runCommand(chatId, commandName, text);
-    if (result === "busy") await ctx.reply("The session is busy. Try the command again when it finishes.");
+    startCommand(chatId, commandName, text);
+    await ctx.reply(`Running /${commandName}…`);
   });
 
   bot.command("start", async (ctx) => {
@@ -514,7 +588,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       return;
     }
     core.setProject(chatId, match);
-    await ctx.reply(`Project set to <code>${escapeHtml(match)}</code>. Start a new session there.`, { parse_mode: "HTML" });
+    await ctx.reply(`Project set to <code>${escapeHtml(match)}</code>. Your next message starts a new session there.`, { parse_mode: "HTML" });
   });
 
   bot.command("agent", async (ctx) => {
@@ -543,7 +617,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
   bot.command("cancel", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
-    await ctx.reply(pendingCommands.delete(chatId) ? "Command cancelled." : "There is no command waiting for arguments.");
+    await ctx.reply(clearPendingCommand(chatId) ? "Command cancelled." : "There is no command waiting for arguments.");
   });
 
   bot.command("compact", async (ctx) => {
@@ -591,8 +665,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     void bot.api.sendChatAction(chatId, "typing").catch((error: unknown) => console.error("typing indicator failed", error));
-    const result = await core.sendPrompt(chatId, ctx.message.text);
-    if (result === "queued") await ctx.reply("⏳ Still working on the previous prompt; yours is queued.");
+    startPrompt(chatId, ctx.message.text);
   });
 
   await bot.api.setMyCommands([
@@ -608,7 +681,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     { command: "status", description: "Show current session settings" },
     { command: "pending", description: "List pending permission requests" },
     { command: "cancel", description: "Cancel a command argument prompt" },
-  ]);
+  ]).catch((error: unknown) => console.error("Telegram command-menu registration failed", error));
 
   return bot;
 }

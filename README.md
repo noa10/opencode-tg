@@ -30,15 +30,15 @@ TG_BOT_TOKEN=...
 TG_ALLOWED_IDS=<your numeric telegram id>
 OPENCODE_URL=http://127.0.0.1:49374
 OPENCODE_USER=opencode
-PROJECT_ALLOWLIST=/Users/you/dev,/Users/you/work
+PROJECT_ALLOWLIST=/home/you/dev,/home/you/work
 # Optional overrides:
-OPENCODE_SERVICE_FILE=/Users/you/.config/opencode/service.json
-TG_STATE=/Users/you/.config/opencode-tg/state.json
+OPENCODE_SERVICE_FILE=/home/you/.config/opencode/service.json
+TG_STATE=/home/you/.config/opencode-tg/state.json
 ```
 
-The default environment, service, and state files live under `~/.config`. Set `TG_ENV` to use a different environment file. `PROJECT_ALLOWLIST` must contain directories OpenCode is allowed to open.
+The default environment, service, and state files live under `~/.config`. Set `TG_ENV` to use a different environment file. `PROJECT_ALLOWLIST` is required and must contain directories OpenCode is allowed to open.
 
-Open the Telegram bot's command menu or send `/menu` to switch the active agent, model and variant, project, or session. The menu also lists project-registered OpenCode commands and offers compact and interrupt actions. Agent and model choices are applied to the current session and reused for new sessions in that project.
+Open the Telegram bot's command menu or send `/menu` to switch the active agent, model and variant, project, or session. The menu also lists project-registered OpenCode commands and offers compact and interrupt actions. Agent and model choices apply to the current session; changing projects clears those choices.
 
 ## Run
 
