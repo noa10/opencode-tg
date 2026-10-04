@@ -80,14 +80,16 @@ test("callback action identifiers do not repeat when the bot restarts", async ()
   assert.notEqual(firstKey, secondKey);
 });
 
-test("pending argument state expires and the next message is handled as a prompt", async (context) => {
+test("pending argument state expires and the next message is handled as a prompt", async () => {
   const prompted: string[] = [];
-  context.mock.timers.enable({ apis: ["setTimeout"] });
-  const harness = await createHarness({ sendPrompt: async (_chatId, text) => { prompted.push(text); return null; } });
+  const harness = await createHarness({
+    sendPrompt: async (_chatId, text) => { prompted.push(text); return null; },
+    pendingCommandTtlMs: 50,
+  });
   await harness.bot.handleUpdate(updateMessage("/commands", 1));
   const argsKey = callbackDataFor(harness.calls, "Args");
   await harness.bot.handleUpdate(updateCallback(argsKey, 2));
-  context.mock.timers.tick(5 * 60 * 1000);
+  await new Promise((resolve) => setTimeout(resolve, 150));
   await harness.bot.handleUpdate(updateMessage("continue normally", 3));
   assert.deepEqual(prompted, ["continue normally"]);
 });

@@ -13,6 +13,7 @@ export type HarnessOptions = {
   readonly listAgents?: () => Promise<unknown[]>;
   readonly runCommand?: (...args: [number, string, string]) => Promise<"completed" | "busy" | "failed">;
   readonly sendPrompt?: (chatId: number, text: string) => Promise<string | null>;
+  readonly pendingCommandTtlMs?: number;
 };
 
 export const USER_ID = 71;
@@ -111,7 +112,7 @@ export async function createHarness(options: HarnessOptions = {}) {
     sendPrompt: options.sendPrompt ?? (async () => null),
     permissionReply: async () => true,
   } as unknown as Core;
-  const bot = await makeBot(config, core, telegramFetch);
+  const bot = await makeBot(config, core, telegramFetch, { pendingCommandTtlMs: options.pendingCommandTtlMs });
   await bot.init();
   return { bot, calls, core, handlers: () => handlers };
 }

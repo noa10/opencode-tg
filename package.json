@@ -6,7 +6,7 @@
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test --test-timeout=30000 tests/*.test.ts"
   },
   "keywords": [],
   "author": "",

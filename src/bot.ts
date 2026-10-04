@@ -62,7 +62,12 @@ function buttonLabel(value: string, max = 48): string {
   return characters.length > max ? `${characters.slice(0, max - 1).join("")}…` : value;
 }
 
-export async function makeBot(config: Config, core: Core, telegramApiFetch?: typeof fetch) {
+export interface BotOptions {
+  readonly pendingCommandTtlMs?: number;
+  readonly permissionTtlMs?: number;
+}
+
+export async function makeBot(config: Config, core: Core, telegramApiFetch?: typeof fetch, options: BotOptions = {}) {
   const bot = new Bot(config.tgToken, {
     client: telegramApiFetch ? { fetch: telegramApiFetch } : {},
   });
@@ -95,6 +100,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     return key;
   }
 
+  const PERMISSION_TTL_EFFECTIVE = options.permissionTtlMs ?? PERMISSION_TTL_MS;
+  const PENDING_COMMAND_TTL_EFFECTIVE = options.pendingCommandTtlMs ?? PENDING_COMMAND_TTL_MS;
+
   function setPendingCommand(chatId: number, name: string): void {
     const previous = pendingCommands.get(chatId);
     if (previous) clearTimeout(previous.timer);
@@ -105,7 +113,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         pendingCommands.delete(chatId);
         void bot.api.sendMessage(chatId, `The argument prompt for /${name} expired. Open /commands to try again.`)
           .catch((error: unknown) => console.error("argument timeout notice failed", error));
-      }, PENDING_COMMAND_TTL_MS),
+      }, PENDING_COMMAND_TTL_EFFECTIVE),
     };
     pending.timer.unref();
     pendingCommands.set(chatId, pending);
@@ -201,7 +209,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
         });
         const notice = accepted ? "Permission timed out and was rejected." : "Permission timed out; rejection could not be sent.";
         await bot.api.sendMessage(chatId, `⏰ ${notice}`).catch((error: unknown) => console.error("permission timeout notice failed", error));
-      }, PERMISSION_TTL_MS);
+      }, PERMISSION_TTL_EFFECTIVE);
       timer.unref();
       permissionMap.set(key, { chatId, request, timer });
     },
