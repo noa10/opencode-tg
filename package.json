@@ -13,6 +13,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
     "eventsource": "^5.1.2",
     "grammy": "^1.46.0",
     "openapi-fetch": "^0.17.0"
@@ -23,5 +24,8 @@
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   },
-  "type": "module"
+  "type": "module",
+  "engines": {
+    "node": ">=20.4"
+  }
 }

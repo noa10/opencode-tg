@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Bot, GrammyError, InlineKeyboard, type Context } from "grammy";
+import { autoRetry } from "@grammyjs/auto-retry";
 import type { components } from "./api";
 import type { Config } from "./config";
 import { Core, type PermissionReq } from "./core";
@@ -65,6 +66,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
   const bot = new Bot(config.tgToken, {
     client: telegramApiFetch ? { fetch: telegramApiFetch } : {},
   });
+  bot.api.config.use(autoRetry({ maxRetryAttempts: 3, rethrowInternalServerErrors: true, rethrowHttpErrors: true, maxDelaySeconds: 10 }));
   const allowed = (id: number | undefined) => id != null && config.allowedIds.has(id);
 
   bot.use(async (ctx, next) => {
@@ -151,7 +153,14 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       void bot.api
         .editMessageText(chatId, prev.messageId, content, { parse_mode: "HTML" })
         .then(() => progressMsg.set(chatId, { messageId: prev.messageId, lastEdit: now }))
-        .catch((error: unknown) => console.error("progress edit failed", error));
+        .catch((error: unknown) => {
+          // editing to identical text is not an error for our throttle
+          if (error instanceof GrammyError && error.error_code === 400 && error.description.includes("message is not modified")) {
+            progressMsg.set(chatId, { messageId: prev.messageId, lastEdit: now });
+            return;
+          }
+          console.error("progress edit failed", error);
+        });
     } else {
       void bot.api
         .sendMessage(chatId, content, { parse_mode: "HTML" })
@@ -371,7 +380,13 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     try {
       await ctx.editMessageText(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
     } catch (error) {
-      if (error instanceof GrammyError && error.description === "Bad Request: message is not modified") return;
+      if (
+        error instanceof GrammyError &&
+        error.error_code === 400 &&
+        error.description.includes("message is not modified")
+      ) {
+        return;
+      }
       throw error;
     }
   }
@@ -545,35 +560,49 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     await ctx.reply(`Running /${commandName}…`);
   });
 
-  bot.command("start", async (ctx) => {
+  // Wrap slash-command handlers: a failure (e.g. OpenCode 401/500 or a restart)
+  // must reply with a redacted error instead of propagating out of bot.start().
+  const guard = (fn: (ctx: any) => Promise<void>) => async (ctx: any) => {
+    try {
+      await fn(ctx);
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      console.error("command failed", error);
+      await ctx
+        .reply(`⚠️ ${escapeHtml(redact(error.message))}`, { parse_mode: "HTML" })
+        .catch((sendError: unknown) => console.error("error reply failed", sendError));
+    }
+  };
+
+  bot.command("start", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const screen = await homeScreen(chatId);
     await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-  });
+  }));
 
-  bot.command("menu", async (ctx) => {
+  bot.command("menu", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const screen = await homeScreen(chatId);
     await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-  });
+  }));
 
-  bot.command("new", async (ctx) => {
+  bot.command("new", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const id = await core.newSession(chatId);
     await ctx.reply(`New session: <code>${escapeHtml(id)}</code>`, { parse_mode: "HTML" });
-  });
+  }));
 
-  bot.command("sessions", async (ctx) => {
+  bot.command("sessions", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const screen = await sessionScreen(chatId, 0);
     await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-  });
+  }));
 
-  bot.command("project", async (ctx) => {
+  bot.command("project", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const arg = ctx.match?.trim();
@@ -582,59 +611,63 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
       return;
     }
-    const match = config.projectAllowlist.find((project) => project === arg || project.endsWith(arg));
-    if (!match) {
+    const matches = config.projectAllowlist.filter((project) => project === arg || project.endsWith(`/${arg}`));
+    if (matches.length === 0) {
       await ctx.reply("Not in the project allowlist.");
       return;
     }
-    core.setProject(chatId, match);
-    await ctx.reply(`Project set to <code>${escapeHtml(match)}</code>. Your next message starts a new session there.`, { parse_mode: "HTML" });
-  });
+    if (matches.length > 1) {
+      await ctx.reply(`Ambiguous: ${matches.length} projects match "${arg}". Give more of the path.`);
+      return;
+    }
+    core.setProject(chatId, matches[0]);
+    await ctx.reply(`Project set to <code>${escapeHtml(matches[0])}</code>. Your next message starts a new session there.`, { parse_mode: "HTML" });
+  }));
 
-  bot.command("agent", async (ctx) => {
+  bot.command("agent", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const screen = await agentScreen(chatId);
     await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-  });
+  }));
 
   for (const command of ["model", "models"] as const) {
-    bot.command(command, async (ctx) => {
+    bot.command(command, guard(async (ctx) => {
       const chatId = ctx.chat?.id;
       if (chatId == null) return;
       const screen = await modelScreen(chatId, 0);
       await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-    });
+    }));
   }
 
-  bot.command("commands", async (ctx) => {
+  bot.command("commands", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const screen = await commandScreen(chatId);
     await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
-  });
+  }));
 
-  bot.command("cancel", async (ctx) => {
+  bot.command("cancel", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     await ctx.reply(clearPendingCommand(chatId) ? "Command cancelled." : "There is no command waiting for arguments.");
-  });
+  }));
 
-  bot.command("compact", async (ctx) => {
+  bot.command("compact", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const accepted = await core.compact(chatId);
     await ctx.reply(accepted ? "Compaction queued for this session." : "OpenCode could not compact this session.");
-  });
+  }));
 
-  bot.command("interrupt", async (ctx) => {
+  bot.command("interrupt", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const ok = await core.interrupt(chatId);
     await ctx.reply(ok ? "Interrupt requested." : "No active session.");
-  });
+  }));
 
-  bot.command("status", async (ctx) => {
+  bot.command("status", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const state = core.getState(chatId);
@@ -645,9 +678,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       `session: <code>${escapeHtml(state.sessionID ?? "none")}</code>\nproject: <code>${escapeHtml(state.projectDir)}</code>\nagent: <code>${escapeHtml(state.agent ?? "OpenCode default")}</code>\nmodel: <code>${escapeHtml(model)}</code>`,
       { parse_mode: "HTML" },
     );
-  });
+  }));
 
-  bot.command("pending", async (ctx) => {
+  bot.command("pending", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
     const pending = await core.getPendingPermissions(chatId);
@@ -659,16 +692,29 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       `<code>${escapeHtml(request.id)}</code> ${escapeHtml(request.action)} ${escapeHtml(request.resources.join(", "))}`,
     );
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
-  });
+  }));
 
-  bot.on("message:text", async (ctx) => {
+  const KNOWN_COMMANDS = new Set([
+    "start", "menu", "new", "sessions", "project", "agent", "model", "models",
+    "commands", "cancel", "compact", "interrupt", "status", "pending",
+  ]);
+
+  bot.on("message:text", guard(async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
+    const text = ctx.message.text;
+    if (text.startsWith("/")) {
+      const name = text.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
+      if (name && !KNOWN_COMMANDS.has(name)) {
+        await ctx.reply(`Unknown command: /${name}. Use /menu to browse what is available.`);
+        return;
+      }
+    }
     void bot.api.sendChatAction(chatId, "typing").catch((error: unknown) => console.error("typing indicator failed", error));
-    startPrompt(chatId, ctx.message.text);
-  });
+    startPrompt(chatId, text);
+  }));
 
-  await bot.api.setMyCommands([
+  void bot.api.setMyCommands([
     { command: "menu", description: "Open controls for agent, model, and sessions" },
     { command: "new", description: "Start a new OpenCode session" },
     { command: "sessions", description: "Choose a session in this project" },
