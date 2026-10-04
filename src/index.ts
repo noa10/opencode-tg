@@ -16,20 +16,34 @@ async function main() {
     `${config.opencodeUrl}/api/event`,
     "Basic " + Buffer.from(`${config.opencodeUser}:${config.opencodePassword}`).toString("base64"),
   );
-  const state = new State();
+  const state = new State(config.statePath);
   const core = new Core(
     client,
     events,
     (chatId) => state.get(chatId, config.defaultProject),
     (chatId, s) => state.set(chatId, s),
-    {} as any, // handlers assigned by makeBot
+    {
+      onPermission: () => {},
+      onProgress: () => {},
+      onDone: () => {},
+      onError: () => {},
+    },
   );
-  const bot = makeBot(config, core);
+  core.restoreSessions(config.allowedIds);
+  const bot = await makeBot(config, core);
   core.attach();
   events.start();
 
   // drop any updates queued while we were offline
   await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+  bot.catch((error) => {
+    const { ctx } = error;
+    console.error("unhandled bot error:", error.error);
+    const message = error.error instanceof Error ? error.error.message : String(error.error);
+    void ctx
+      .reply(`⚠️ ${message.slice(0, 500)}`)
+      .catch((sendError: unknown) => console.error("error reply failed", sendError));
+  });
   await bot.start({
     onStart: (info) => console.log(`bot started as @${info.username}`),
   });

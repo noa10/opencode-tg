@@ -5,6 +5,8 @@ Telegram bridge for [OpenCode](https://opencode.ai) v2 — drive the agent from 
 - Long-polling only; no public ports (OpenCode stays on `127.0.0.1:49374`)
 - HTTP Basic auth to the local OpenCode service (password read from `~/.config/opencode/service.json`)
 - Chat → session continuity, per-chat project allowlist
+- Telegram `/menu` with Plan/Build and custom primary agent selection, model variants, project/session switching
+- Registered OpenCode commands, session compaction, and interrupt controls
 - Permission prompts as inline buttons (`permission.asked` → session-scoped reply route)
 - Busy-session queue, `/interrupt`, SSE-driven progress updates
 - Whitelist of Telegram user IDs, private chats only, stale-update drop
@@ -28,10 +30,15 @@ TG_BOT_TOKEN=...
 TG_ALLOWED_IDS=<your numeric telegram id>
 OPENCODE_URL=http://127.0.0.1:49374
 OPENCODE_USER=opencode
-PROJECT_ALLOWLIST=/home/ubuntu,/home/ubuntu/repos
+PROJECT_ALLOWLIST=/home/you/dev,/home/you/work
+# Optional overrides:
+OPENCODE_SERVICE_FILE=/home/you/.config/opencode/service.json
+TG_STATE=/home/you/.config/opencode-tg/state.json
 ```
 
-State: `~/.config/opencode-tg/state.json`.
+The default environment, service, and state files live under `~/.config`. Set `TG_ENV` to use a different environment file. `PROJECT_ALLOWLIST` is required and must contain directories OpenCode is allowed to open.
+
+Open the Telegram bot's command menu or send `/menu` to switch the active agent, model and variant, project, or session. The menu also lists project-registered OpenCode commands and offers compact and interrupt actions. Agent and model choices apply to the current session; changing projects clears those choices.
 
 ## Run
 

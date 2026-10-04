@@ -1,16 +1,22 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { homedir } from "node:os";
+import type { components } from "./api";
+
+type ModelRef = components["schemas"]["Model.Ref"];
 
 export interface ChatState {
   sessionID?: string;
   projectDir: string;
+  agent?: string;
+  model?: ModelRef;
 }
 
 export class State {
   private path: string;
   private data: Record<string, ChatState> = {};
 
-  constructor(path = "/home/ubuntu/.config/opencode-tg/state.json") {
+  constructor(path = `${homedir()}/.config/opencode-tg/state.json`) {
     this.path = path;
     if (existsSync(path)) {
       try {
