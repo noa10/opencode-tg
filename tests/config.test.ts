@@ -11,7 +11,7 @@ function withEnv(envText: string, run: () => void) {
   const serviceFile = join(directory, "service.json");
   const previousEnvPath = process.env.TG_ENV;
   try {
-    writeFileSync(envPath, envText);
+    writeFileSync(envPath, `${envText}\nOPENCODE_SERVICE_FILE=${serviceFile}\n`);
     writeFileSync(serviceFile, JSON.stringify({ password: "secret" }));
     process.env.TG_ENV = envPath;
     run();
