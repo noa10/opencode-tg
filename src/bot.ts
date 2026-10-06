@@ -144,6 +144,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       if (result === "queued") {
         return bot.api.sendMessage(chatId, "⏳ Still working on the previous prompt; yours is queued.");
       }
+      if (result === "dropped") {
+        return bot.api.sendMessage(chatId, "⚠️ Queue is full — drop the pending work or wait for the current turn to finish.");
+      }
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       return bot.api.sendMessage(chatId, `⚠️ ${escapeHtml(redact(message))}`, { parse_mode: "HTML" })
@@ -724,40 +727,36 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
 
   const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
-  function attachmentMeta(message: any): { fileId: string; name: string; mime?: string; size?: number; caption?: string } | undefined {
+  type AttachmentMeta = { fileId: string; name: string; mime?: string; size?: number; caption?: string; chatAction: "upload_document" | "upload_photo" };
+
+  // Only the five message types registered below reach here, so this always resolves.
+  function attachmentMeta(message: any): AttachmentMeta {
     if (message.document) {
-      return { fileId: message.document.file_id, name: message.document.file_name ?? "document", mime: message.document.mime_type, size: message.document.file_size, caption: message.caption };
+      return { fileId: message.document.file_id, name: message.document.file_name ?? "document", mime: message.document.mime_type, size: message.document.file_size, caption: message.caption, chatAction: "upload_document" };
     }
     if (Array.isArray(message.photo) && message.photo.length > 0) {
       const largest = message.photo[message.photo.length - 1];
-      return { fileId: largest.file_id, name: "photo.jpg", mime: "image/jpeg", size: largest.file_size, caption: message.caption };
+      return { fileId: largest.file_id, name: "photo.jpg", mime: "image/jpeg", size: largest.file_size, caption: message.caption, chatAction: "upload_photo" };
     }
     if (message.video) {
-      return { fileId: message.video.file_id, name: message.video.file_name ?? "video.mp4", mime: message.video.mime_type, size: message.video.file_size, caption: message.caption };
+      return { fileId: message.video.file_id, name: message.video.file_name ?? "video.mp4", mime: message.video.mime_type, size: message.video.file_size, caption: message.caption, chatAction: "upload_document" };
     }
     if (message.audio) {
-      return { fileId: message.audio.file_id, name: message.audio.file_name ?? "audio.mp3", mime: message.audio.mime_type, size: message.audio.file_size, caption: message.caption };
+      return { fileId: message.audio.file_id, name: message.audio.file_name ?? "audio.mp3", mime: message.audio.mime_type, size: message.audio.file_size, caption: message.caption, chatAction: "upload_document" };
     }
-    if (message.voice) {
-      return { fileId: message.voice.file_id, name: `voice-${message.date ?? Date.now()}.oga`, mime: message.voice.mime_type ?? "audio/ogg", size: message.voice.file_size, caption: message.caption };
-    }
-    return undefined;
+    return { fileId: message.voice.file_id, name: `voice-${message.date ?? Date.now()}.oga`, mime: message.voice.mime_type ?? "audio/ogg", size: message.voice.file_size, caption: message.caption, chatAction: "upload_document" };
   }
 
   async function handleAttachment(ctx: Context): Promise<void> {
     const chatId = ctx.chat?.id;
     if (chatId == null) return;
-    const meta = attachmentMeta(ctx.message);
-    if (!meta) {
-      await ctx.reply("Unsupported attachment type. I can handle documents, photos, videos, audio, and voice notes.");
-      return;
-    }
-    if (typeof meta.size === "number" && meta.size > MAX_ATTACHMENT_BYTES) {
-      await ctx.reply("File is too large — maximum is 20 MB.");
-      return;
-    }
-    void bot.api.sendChatAction(chatId, "upload_document").catch(() => {});
     try {
+      const meta = attachmentMeta(ctx.message);
+      if (typeof meta.size === "number" && meta.size > MAX_ATTACHMENT_BYTES) {
+        await ctx.reply("File is too large — maximum is 20 MB.");
+        return;
+      }
+      void bot.api.sendChatAction(chatId, meta.chatAction).catch(() => {});
       const file = await ctx.getFile();
       if (!file.file_path) throw new Error("Telegram returned no file path");
       const fromTelegram = typeof telegramApiFetch === "function" ? telegramApiFetch : fetch;
@@ -772,6 +771,8 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       const result = await core.attachFile(chatId, { name: meta.name, mime: meta.mime, caption: meta.caption, bytes });
       if (result === "queued") {
         await ctx.reply("⏳ Still working on the previous prompt; the attachment is queued.");
+      } else if (result === "dropped") {
+        await ctx.reply("⚠️ Queue is full — drop the pending work or wait for the current turn to finish.");
       }
     } catch (error) {
       if (!(error instanceof Error)) throw error;

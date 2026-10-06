@@ -25,6 +25,7 @@ export interface AttachmentInput {
 export type AttachWrite = (directory: string, name: string, bytes: Uint8Array) => Promise<void>;
 
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_QUEUED_ENTRIES = 5;
 
 async function defaultAttachWrite(directory: string, name: string, bytes: Uint8Array): Promise<void> {
   // Fallback: the bridge runs on the same host as the OpenCode server, so the
@@ -496,6 +497,7 @@ export class Core {
 
     if (this.busyChats.has(chatId)) {
       const q = this.queues.get(chatId) ?? [];
+      if (q.length >= MAX_QUEUED_ENTRIES) return "dropped";
       q.push({ kind: "text", text });
       this.queues.set(chatId, q);
       return "queued";
@@ -565,12 +567,14 @@ export class Core {
     }
   }
 
-  async attachFile(chatId: number, entry: AttachmentInput): Promise<string | null> {
+  async attachFile(chatId: number, entry: AttachmentInput): Promise<"queued" | "dropped" | null> {
     const sessionID = await this.ensureSession(chatId);
     this.sessionChat.set(sessionID, chatId);
 
     if (this.busyChats.has(chatId)) {
       const q = this.queues.get(chatId) ?? [];
+      // queued attachments hold their bytes in memory (up to 20 MB each), so cap the queue
+      if (q.length >= MAX_QUEUED_ENTRIES) return "dropped";
       q.push({ kind: "attachment", name: entry.name, mime: entry.mime, caption: entry.caption, bytes: entry.bytes });
       this.queues.set(chatId, q);
       return "queued";
@@ -590,7 +594,13 @@ export class Core {
   }
 
   private async uniqueAttachmentName(directory: string, rawName: string): Promise<string> {
-    const clean = basename(rawName).replace(/[\\/:*?"<>|]/g, "_").slice(0, 80) || "attachment";
+    // NOTE: collision detection assumes the bridge and the OpenCode server share a
+    // filesystem (true with the default same-host wiring). If they are ever split,
+    // this degrades to overwrite-on-collision rather than failing.
+    let clean = basename(rawName).replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+    // all-dots names ("..", ".") would escape or alias the target directory, and the
+    // server write endpoint does not confine writes to the requested location
+    if (!clean || /^\.+$/.test(clean)) clean = "attachment";
     if (!existsSync(join(directory, clean))) return clean;
     let candidate = `${Date.now()}-${clean}`;
     let i = 1;

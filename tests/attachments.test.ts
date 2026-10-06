@@ -79,6 +79,88 @@ test("an uploaded document is written to the project dir and referenced in the p
   }
 });
 
+test("an all-dots filename is replaced instead of escaping the project dir", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
+  const prompts: string[] = [];
+  let promptedSession: string | undefined;
+  const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
+  const client = {
+    GET: async (path: string) => {
+      if (path === "/api/session/{sessionID}/message") {
+        return { data: { data: [{ type: "assistant", content: [{ type: "text", text: "done" }] }] }, error: undefined };
+      }
+      return { data: { data: { id: "session-1", location: { directory } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { body?: unknown; params?: { path?: { sessionID?: string } } }) => {
+      if (path === "/api/session/{sessionID}/prompt") {
+        prompts.push(String((options?.body as { text: string }).text));
+        promptedSession = options?.params?.path?.sessionID;
+      }
+      return { data: { data: true }, error: undefined, response: new Response(null, { status: 200 }) };
+    },
+  } as unknown as Partial<Client>;
+  const writes: string[] = [];
+
+  try {
+    const { core, emit } = coreWithEvents(
+      client,
+      { sessionID: "session-1", projectDir: directory },
+      handlers,
+      async (_dir, name) => { writes.push(name); },
+    );
+    const done = core.attachFile(USER_ID, { name: "..", caption: "look", bytes: new Uint8Array([1]) });
+    await waitFor(() => promptedSession !== undefined, "the prompt to be sent");
+    emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } } as OcEvent);
+    assert.equal(await done, null);
+    assert.deepEqual(writes, ["attachment"], `expected a safe fallback name, got ${JSON.stringify(writes)}`);
+    assert.match(prompts.join("\n"), /\(File attached: \.\/attachment\)/);
+  } finally {
+    release();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the queue drops attachments past its cap instead of growing without bound", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
+  const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
+  let releasePost: (() => void) | undefined;
+  let promptedSession: string | undefined;
+  const gate = new Promise<void>((resolve) => { releasePost = resolve; });
+  const client = {
+    GET: async (path: string) => {
+      if (path === "/api/session/{sessionID}/message") return { data: { data: [] }, error: undefined };
+      return { data: { data: { id: "s1", location: { directory } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { params?: { path?: { sessionID?: string } } }) => {
+      if (path.includes("/prompt")) {
+        promptedSession = options?.params?.path?.sessionID;
+        await gate;
+      }
+      return { data: { data: true }, error: undefined };
+    },
+  } as unknown as Partial<Client>;
+  const { core, emit } = coreWithEvents(client, { sessionID: "s1", projectDir: directory }, handlers, async () => {});
+
+  try {
+    const first = core.sendPrompt(USER_ID, "first");
+    await waitFor(() => promptedSession !== undefined, "the first prompt");
+    const results: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      results.push(await core.attachFile(USER_ID, { name: `f${i}.txt`, bytes: new Uint8Array([1]) }) ?? "ran");
+    }
+    assert.ok(results.includes("queued"), "some attachments should queue");
+    assert.ok(results.includes("dropped"), "attachments past the cap should be dropped");
+    releasePost?.();
+    emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } } as OcEvent);
+    await first;
+  } finally {
+    release();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("an empty caption falls back to a review prompt", async () => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
   const release = keepAlive();

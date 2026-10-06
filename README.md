@@ -29,6 +29,12 @@ active project's directory; the caption (or "Please review this file.") becomes 
 the agent reads the saved file with its normal tools. Files above 20 MB are rejected — that is
 also Telegram's bot download limit. No transcription for voice notes.
 
+Limits: stickers, animations and video notes are not handled. A multi-photo album arrives as
+separate messages, so each image becomes its own prompt and only the one carrying the caption has
+an instruction attached. The queue holds at most 5 pending items per chat; beyond that new items
+are dropped with a notice rather than kept in memory. Uploaded files land in the project's working
+directory and are never cleaned up.
+
 ## Config
 
 `~/.config/opencode-tg/env` (chmod 600):
