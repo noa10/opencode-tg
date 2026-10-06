@@ -3,9 +3,35 @@ import { EventBus, type OcEvent } from "./events";
 import type { components } from "./api";
 import type { ChatState } from "./state";
 import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 function resolvePath(value: string): string {
   return resolve(value);
+}
+
+export type QueueEntry =
+  | { kind: "text"; text: string }
+  | { kind: "attachment"; name: string; mime?: string; caption?: string; bytes: Uint8Array };
+
+export interface AttachmentInput {
+  name: string;
+  mime?: string;
+  caption?: string;
+  bytes: Uint8Array;
+}
+
+export type AttachWrite = (directory: string, name: string, bytes: Uint8Array) => Promise<void>;
+
+const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function defaultAttachWrite(directory: string, name: string, bytes: Uint8Array): Promise<void> {
+  // Fallback: the bridge runs on the same host as the OpenCode server, so the
+  // project directory is the same filesystem. Production wiring prefers the
+  // server-side write endpoint (see opencode.ts / index.ts).
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, name), bytes);
 }
 
 type AgentInfo = components["schemas"]["Agent.Info"];
@@ -31,7 +57,7 @@ export interface CoreHandlers {
 export class Core {
   sessionChat = new Map<string, number>();
   private busyChats = new Set<number>();
-  private queues = new Map<number, string[]>(); // chatId -> queued prompts
+  private queues = new Map<number, QueueEntry[]>(); // chatId -> queued prompts/attachments
   private pendingExecution = new Map<string, { resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>();
   private validatedSessions = new Set<string>();
   private sessionInitializations = new Map<number, Map<string, Promise<string>>>();
@@ -42,9 +68,13 @@ export class Core {
     public getState: (chatId: number) => ChatState,
     public setState: (chatId: number, s: ChatState) => void,
     private handlersInit: CoreHandlers,
+    private attachWrite?: AttachWrite,
   ) {
     this.handlers = handlersInit;
+    this.attachWriteFn = attachWrite ?? defaultAttachWrite;
   }
+
+  private attachWriteFn: AttachWrite;
 
   private handlers: CoreHandlers;
 
@@ -400,7 +430,9 @@ export class Core {
         this.pendingExecution.delete(sessionID);
         void this.interruptSession(sessionID);
         resolve(false);
-      }, 10 * 60 * 1000);
+      }, EXECUTION_TIMEOUT_MS);
+      // never keep the process alive just to watch for a slow agent turn
+      timer.unref?.();
       this.pendingExecution.set(sessionID, { resolve, timer });
     });
   }
@@ -445,9 +477,16 @@ export class Core {
       return;
     }
     if (!queue?.length) this.queues.delete(chatId);
-    void this.sendPrompt(chatId, next).catch((error) => {
+    if (next.kind === "text") {
+      void this.sendPrompt(chatId, next.text).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.handlers.onError(chatId, `queued prompt failed: ${message}`);
+      });
+      return;
+    }
+    void this.attachFile(chatId, next).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
-      this.handlers.onError(chatId, `queued prompt failed: ${message}`);
+      this.handlers.onError(chatId, `queued attachment failed: ${message}`);
     });
   }
 
@@ -457,7 +496,7 @@ export class Core {
 
     if (this.busyChats.has(chatId)) {
       const q = this.queues.get(chatId) ?? [];
-      q.push(text);
+      q.push({ kind: "text", text });
       this.queues.set(chatId, q);
       return "queued";
     }
@@ -499,7 +538,7 @@ export class Core {
       return this.finishWithMessages(sessionID, chatId);
     }
     if (sent.error) {
-      this.pendingExecution.delete(sessionID);
+      this.cancelExecution(sessionID);
       this.handlers.onError(chatId, `prompt failed: ${JSON.stringify(sent.error).slice(0, 300)}`);
       return;
     }
@@ -524,6 +563,39 @@ export class Core {
     } catch (err: any) {
       this.handlers.onError(chatId, `fetch messages failed: ${err?.message ?? err}`);
     }
+  }
+
+  async attachFile(chatId: number, entry: AttachmentInput): Promise<string | null> {
+    const sessionID = await this.ensureSession(chatId);
+    this.sessionChat.set(sessionID, chatId);
+
+    if (this.busyChats.has(chatId)) {
+      const q = this.queues.get(chatId) ?? [];
+      q.push({ kind: "attachment", name: entry.name, mime: entry.mime, caption: entry.caption, bytes: entry.bytes });
+      this.queues.set(chatId, q);
+      return "queued";
+    }
+    this.busyChats.add(chatId);
+    try {
+      const st = this.getState(chatId);
+      const name = await this.uniqueAttachmentName(st.projectDir, entry.name);
+      await this.attachWriteFn(st.projectDir, name, entry.bytes);
+      const prompt = `${entry.caption?.trim() || "Please review this file."}\n\n(File attached: ./${name})`;
+      await this.runPrompt(sessionID, chatId, prompt);
+    } finally {
+      this.busyChats.delete(chatId);
+      this.drainPromptQueue(chatId);
+    }
+    return null;
+  }
+
+  private async uniqueAttachmentName(directory: string, rawName: string): Promise<string> {
+    const clean = basename(rawName).replace(/[\\/:*?"<>|]/g, "_").slice(0, 80) || "attachment";
+    if (!existsSync(join(directory, clean))) return clean;
+    let candidate = `${Date.now()}-${clean}`;
+    let i = 1;
+    while (existsSync(join(directory, candidate))) candidate = `${Date.now()}-${i++}-${clean}`;
+    return candidate;
   }
 
   async permissionReply(sessionID: string, requestID: string, decision: "once" | "always" | "reject") {

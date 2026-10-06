@@ -1,5 +1,5 @@
 import { loadConfig } from "./config";
-import { makeClient } from "./opencode";
+import { makeClient, writeProjectFile } from "./opencode";
 import { EventBus } from "./events";
 import { Core } from "./core";
 import { State } from "./state";
@@ -28,6 +28,13 @@ async function main() {
       onDone: () => {},
       onError: () => {},
     },
+    (directory, name, bytes) =>
+      writeProjectFile(
+        { url: config.opencodeUrl, user: config.opencodeUser, password: config.opencodePassword },
+        directory,
+        name,
+        bytes,
+      ),
   );
   core.restoreSessions(config.allowedIds);
   const bot = await makeBot(config, core);

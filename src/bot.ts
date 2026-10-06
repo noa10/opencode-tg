@@ -543,7 +543,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     }
   });
 
-  bot.on("message:text", async (ctx, next) => {
+  bot.on(["message:text", "message:document", "message:photo", "message:video", "message:audio", "message:voice"], async (ctx, next) => {
     if (Date.now() / 1000 - (ctx.message.date ?? 0) > FRESH_MS / 1000) return;
     await next();
   });
@@ -721,6 +721,68 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     void bot.api.sendChatAction(chatId, "typing").catch((error: unknown) => console.error("typing indicator failed", error));
     startPrompt(chatId, text);
   }));
+
+  const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+  function attachmentMeta(message: any): { fileId: string; name: string; mime?: string; size?: number; caption?: string } | undefined {
+    if (message.document) {
+      return { fileId: message.document.file_id, name: message.document.file_name ?? "document", mime: message.document.mime_type, size: message.document.file_size, caption: message.caption };
+    }
+    if (Array.isArray(message.photo) && message.photo.length > 0) {
+      const largest = message.photo[message.photo.length - 1];
+      return { fileId: largest.file_id, name: "photo.jpg", mime: "image/jpeg", size: largest.file_size, caption: message.caption };
+    }
+    if (message.video) {
+      return { fileId: message.video.file_id, name: message.video.file_name ?? "video.mp4", mime: message.video.mime_type, size: message.video.file_size, caption: message.caption };
+    }
+    if (message.audio) {
+      return { fileId: message.audio.file_id, name: message.audio.file_name ?? "audio.mp3", mime: message.audio.mime_type, size: message.audio.file_size, caption: message.caption };
+    }
+    if (message.voice) {
+      return { fileId: message.voice.file_id, name: `voice-${message.date ?? Date.now()}.oga`, mime: message.voice.mime_type ?? "audio/ogg", size: message.voice.file_size, caption: message.caption };
+    }
+    return undefined;
+  }
+
+  async function handleAttachment(ctx: Context): Promise<void> {
+    const chatId = ctx.chat?.id;
+    if (chatId == null) return;
+    const meta = attachmentMeta(ctx.message);
+    if (!meta) {
+      await ctx.reply("Unsupported attachment type. I can handle documents, photos, videos, audio, and voice notes.");
+      return;
+    }
+    if (typeof meta.size === "number" && meta.size > MAX_ATTACHMENT_BYTES) {
+      await ctx.reply("File is too large — maximum is 20 MB.");
+      return;
+    }
+    void bot.api.sendChatAction(chatId, "upload_document").catch(() => {});
+    try {
+      const file = await ctx.getFile();
+      if (!file.file_path) throw new Error("Telegram returned no file path");
+      const fromTelegram = typeof telegramApiFetch === "function" ? telegramApiFetch : fetch;
+      const url = `https://api.telegram.org/file/bot${config.tgToken}/${file.file_path}`;
+      const res = await fromTelegram(url);
+      if (!res.ok) throw new Error(`Telegram download failed: ${res.status}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+        await ctx.reply("File is too large — maximum is 20 MB.");
+        return;
+      }
+      const result = await core.attachFile(chatId, { name: meta.name, mime: meta.mime, caption: meta.caption, bytes });
+      if (result === "queued") {
+        await ctx.reply("⏳ Still working on the previous prompt; the attachment is queued.");
+      }
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      console.error("attachment handling failed", error);
+      await ctx.reply(`⚠️ ${escapeHtml(redact(error.message))}`, { parse_mode: "HTML" }).catch(() => {});
+    }
+  }
+
+  for (const type of ["message:document", "message:photo", "message:video", "message:audio", "message:voice"] as const) {
+    bot.on(type, guard(async (ctx) => handleAttachment(ctx)));
+  }
 
   void bot.api.setMyCommands([
     { command: "menu", description: "Open controls for agent, model, and sessions" },

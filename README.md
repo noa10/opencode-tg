@@ -19,7 +19,15 @@ Telegram bridge for [OpenCode](https://opencode.ai) v2 — drive the agent from 
 - `src/bot.ts` — grammY adapter (commands, inline keyboards, throttled progress)
 - `src/events.ts` — SSE subscriber with reconnect
 - `src/format.ts` — HTML escaping, chunking, redaction
+- `src/opencode.ts` — typed API client plus the server-side file write used for attachments
 - `scripts/smoke.ts` — REST smoke test (create session → prompt → messages)
+
+## Attachments
+
+Send a document, photo, video, audio file, or voice note to the bot and it is saved into the
+active project's directory; the caption (or "Please review this file.") becomes the prompt and
+the agent reads the saved file with its normal tools. Files above 20 MB are rejected — that is
+also Telegram's bot download limit. No transcription for voice notes.
 
 ## Config
 
