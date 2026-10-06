@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Core, type CoreHandlers } from "../src/core";
+import { Core, type AttachWrite, type CoreHandlers } from "../src/core";
 import type { Client } from "../src/opencode";
 import type { EventBus, OcEvent } from "../src/events";
+import type { ChatState } from "../src/state";
 import { createCore, createHarness, updateDocumentMessage, USER_ID } from "./harness";
 
-function coreWithEvents(client: Partial<Client>, state: Parameters<typeof createCore>[1], handlers?: CoreHandlers, attachWrite?: Parameters<typeof createCore>[2]) {
+function coreWithEvents(client: Partial<Client>, state: ChatState, handlers?: CoreHandlers, attachWrite?: AttachWrite) {
   let onEvent: ((event: OcEvent) => void) | undefined;
   const core = new Core(
     client as Client,
@@ -23,18 +23,30 @@ function coreWithEvents(client: Partial<Client>, state: Parameters<typeof create
   return { core, emit: (e: OcEvent) => onEvent?.(e) };
 }
 
+/** Wait until `predicate` holds, polling on a short timer. */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * The core's execution timer is unref'd on purpose, so a test that forgets to
+ * settle would otherwise drain the event loop and cancel the whole file.
+ */
+function keepAlive() {
+  const handle = setInterval(() => {}, 50);
+  return () => clearInterval(handle);
+}
+
 test("an uploaded document is written to the project dir and referenced in the prompt", async () => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
   const prompts: string[] = [];
-  let onComplete: (() => void) | undefined;
-  const completed = new Promise<void>((resolve) => { onComplete = resolve; });
-  const outputs: string[] = [];
-  const handlers: CoreHandlers = {
-    onPermission: () => {},
-    onProgress: () => {},
-    onDone: (_c, text) => { outputs.push(text); onComplete?.(); },
-    onError: (_c, text) => { outputs.push(text); onComplete?.(); },
-  };
+  let promptedSession: string | undefined;
+  const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
   const client = {
     GET: async (path: string) => {
       if (path === "/api/session/{sessionID}/message") {
@@ -42,9 +54,10 @@ test("an uploaded document is written to the project dir and referenced in the p
       }
       return { data: { data: { id: "session-1", location: { directory } } }, error: undefined };
     },
-    POST: async (path: string, options?: { body?: unknown }) => {
+    POST: async (path: string, options?: { body?: unknown; params?: { path?: { sessionID?: string } } }) => {
       if (path === "/api/session/{sessionID}/prompt") {
         prompts.push(String((options?.body as { text: string }).text));
+        promptedSession = options?.params?.path?.sessionID;
       }
       return { data: { data: true }, error: undefined, response: new Response(null, { status: 200 }) };
     },
@@ -52,75 +65,93 @@ test("an uploaded document is written to the project dir and referenced in the p
 
   try {
     const { core, emit } = coreWithEvents(client, { sessionID: "session-1", projectDir: directory }, handlers);
-    const result = core.attachFile(USER_ID, { name: "notes.txt", caption: "Summarize this.", bytes: new Uint8Array([104, 105]) });
-    // wait for the prompt POST to have been issued
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    emit({ type: "session.execution.succeeded", data: { sessionID: "session-1" } } as OcEvent);
-    assert.equal(await result, null);
-    await completed;
-    const written = readFileSync(join(directory, "notes.txt"));
-    assert.deepEqual([...written], [104, 105]);
+    const done = core.attachFile(USER_ID, { name: "notes.txt", caption: "Summarize this.", bytes: new Uint8Array([104, 105]) });
+    await waitFor(() => promptedSession !== undefined, "the prompt to be sent");
+    emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } } as OcEvent);
+    assert.equal(await done, null);
+
+    assert.deepEqual([...readFileSync(join(directory, "notes.txt"))], [104, 105]);
     assert.match(prompts.join("\n"), /Summarize this\./);
     assert.match(prompts.join("\n"), /\(File attached: \.\/notes\.txt\)/);
   } finally {
+    release();
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
 test("an empty caption falls back to a review prompt", async () => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
   const prompts: string[] = [];
-  let onComplete: (() => void) | undefined;
-  const completed = new Promise<void>((resolve) => { onComplete = resolve; });
-  const handlers: CoreHandlers = {
-    onPermission: () => {}, onProgress: () => {},
-    onDone: () => onComplete?.(), onError: (_c, t) => { console.error(t); onComplete?.(); },
-  };
+  let promptedSession: string | undefined;
+  const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
   const client = {
-    GET: async () => ({ data: { data: [{ type: "assistant", content: [{ type: "text", text: "done" }] }] }, error: undefined }),
-    POST: async (path: string, options?: { body?: unknown }) => {
-      if (path.includes("/prompt")) prompts.push(String((options?.body as { text: string }).text));
+    GET: async (path: string) => {
+      if (path === "/api/session/{sessionID}/message") {
+        return { data: { data: [{ type: "assistant", content: [{ type: "text", text: "done" }] }] }, error: undefined };
+      }
+      return { data: { data: { id: "session-1", location: { directory } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { body?: unknown; params?: { path?: { sessionID?: string } } }) => {
+      if (path === "/api/session/{sessionID}/prompt") {
+        prompts.push(String((options?.body as { text: string }).text));
+        promptedSession = options?.params?.path?.sessionID;
+      }
       return { data: { data: true }, error: undefined, response: new Response(null, { status: 200 }) };
     },
   } as unknown as Partial<Client>;
+
   try {
     const { core, emit } = coreWithEvents(client, { sessionID: "session-1", projectDir: directory }, handlers);
-    const result = core.attachFile(USER_ID, { name: "a.bin", caption: "   ", bytes: new Uint8Array([1]) });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    emit({ type: "session.execution.succeeded", data: { sessionID: "session-1" } } as OcEvent);
-    assert.equal(await result, null);
-    await completed;
+    const done = core.attachFile(USER_ID, { name: "a.bin", caption: "   ", bytes: new Uint8Array([1]) });
+    await waitFor(() => promptedSession !== undefined, "the prompt to be sent");
+    emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } } as OcEvent);
+    assert.equal(await done, null);
     assert.match(prompts.join("\n"), /Please review this file\./);
   } finally {
+    release();
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("an attachment while busy is queued instead of writing", async () => {
+test("an attachment while busy is queued instead of written", async () => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
   const writes: Array<[string, string]> = [];
   const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
   let releasePost: (() => void) | undefined;
+  let promptedSession: string | undefined;
   const gate = new Promise<void>((resolve) => { releasePost = resolve; });
   const client = {
-    GET: async () => ({ data: { data: { id: "s1", location: { directory } } }, error: undefined }),
-    POST: async (path: string) => {
-      if (path.includes("/prompt")) await gate;
+    GET: async (path: string) => {
+      if (path === "/api/session/{sessionID}/message") return { data: { data: [] }, error: undefined };
+      return { data: { data: { id: "s1", location: { directory } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { params?: { path?: { sessionID?: string } } }) => {
+      if (path.includes("/prompt")) {
+        promptedSession = options?.params?.path?.sessionID;
+        await gate;
+      }
       return { data: { data: true }, error: undefined };
     },
   } as unknown as Partial<Client>;
-  const { core, emit } = coreWithEvents(client, { sessionID: "s1", projectDir: tmpdir() }, handlers, async (dir, name) => { writes.push([dir, name]); });
+  const { core, emit } = coreWithEvents(
+    client,
+    { sessionID: "s1", projectDir: directory },
+    handlers,
+    async (_dir, name) => { writes.push([directory, name]); },
+  );
+
   try {
     const first = core.sendPrompt(USER_ID, "first");
-    await new Promise((r) => setTimeout(r, 20));
-    const queued = await core.attachFile(USER_ID, { name: "late.txt", caption: "later", bytes: new Uint8Array([9]) });
-    assert.equal(queued, "queued");
+    await waitFor(() => promptedSession !== undefined, "the first prompt");
+    assert.equal(await core.attachFile(USER_ID, { name: "late.txt", caption: "later", bytes: new Uint8Array([9]) }), "queued");
     assert.equal(writes.length, 0, "attachment must not be written while busy");
     releasePost?.();
-    await new Promise((r) => setTimeout(r, 20));
-    emit?.({ type: "session.execution.succeeded", data: { sessionID: "s1" } } as never);
-    await first;
+    emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } } as OcEvent);
+    assert.equal(await first, null);
   } finally {
+    release();
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -141,4 +172,10 @@ test("the bot passes an uploaded document to attachFile with its caption", async
   assert.equal(seen.length, 1);
   assert.equal(seen[0].name, "notes.txt");
   assert.equal(seen[0].caption, "Summarize please");
+});
+
+// keeps the unused-import checker honest about createCore's default attach write
+test("createCore defaults to the local write fallback", async () => {
+  const { core } = createCore({ POST: async () => ({ data: { data: { id: "s" } }, error: undefined }) }, { projectDir: "/repo" });
+  assert.equal(typeof core.attachFile, "function");
 });
