@@ -9,11 +9,29 @@ import { loadConfig } from "../src/config";
 import { makeClient, writeProjectFile } from "../src/opencode";
 import { EventBus } from "../src/events";
 import { Core, type CoreHandlers } from "../src/core";
+import { FreeModelSelector } from "../src/models";
 import { State } from "../src/state";
 import { makeBot } from "../src/bot";
 
 const USER_ID = 65_889_010;
 const FILE_BYTES = new TextEncoder().encode(`ROUND_TRIP_${Date.now()}\n`);
+
+function photoUpdate() {
+  return {
+    update_id: 9002,
+    message: {
+      message_id: 2,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: USER_ID, type: "private" as const },
+      from: { id: USER_ID, is_bot: false, first_name: "Tester" },
+      caption: "Reply with only: photo-ok",
+      photo: [
+        { file_id: "small", file_unique_id: "s", width: 90, height: 60, file_size: 100 },
+        { file_id: "tg-photo-id", file_unique_id: "p", width: 800, height: 600, file_size: 900 },
+      ],
+    },
+  };
+}
 
 function documentUpdate(fileSize?: number, caption?: string, fileName = "round-trip.txt") {
   return {
@@ -40,14 +58,20 @@ async function main() {
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-tg-rt-"));
   const replies: string[] = [];
 
+  const chatActions: string[] = [];
   const telegramFetch: typeof fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
     if (url.includes("/file/bot")) return new Response(FILE_BYTES, { status: 200 });
     const method = new URL(url).pathname.split("/").at(-1) ?? "";
     const payload = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
     if (method === "getFile") {
-      return Response.json({ ok: true, result: { file_id: "tg-file-id", file_unique_id: "u1", file_path: "documents/file_1.txt" } });
+      const id = String(payload.file_id ?? "");
+      return Response.json({
+        ok: true,
+        result: { file_id: id, file_unique_id: "u1", file_path: id === "tg-photo-id" ? "photos/file_2.jpg" : "documents/file_1.txt" },
+      });
     }
+    if (method === "sendChatAction") chatActions.push(String(payload.action));
     if (method === "sendMessage") {
       replies.push(String(payload.text ?? ""));
       return Response.json({
@@ -81,6 +105,8 @@ async function main() {
     (chatId, s) => state.set(chatId, s),
     handlers,
     (directory, name, bytes) => writeProjectFile({ url: config.opencodeUrl, user: config.opencodeUser, password: config.opencodePassword }, directory, name, bytes),
+    new FreeModelSelector(client, undefined, [config.defaultProject]),
+    config.modelPolicy,
   );
   const bot = await makeBot({ ...config, tgToken: "test-token", allowedIds: new Set([USER_ID]), projectAllowlist: [projectDir], defaultProject: projectDir }, core, telegramFetch);
   await bot.init();
@@ -99,15 +125,24 @@ async function main() {
   // give the agent turn time to finish
   for (let i = 0; i < 60 && outputs.length === 0; i++) await new Promise((r) => setTimeout(r, 1000));
   console.log("bot replies during turn:", replies.join(" | ") || "(none)");
-  console.log("core outputs:", outputs.join(" | ") || "(none)");
+  const docReplies = replies.slice();
+
+  console.log("\n== photo upload (largest size must be used) ==");
+  replies.length = 0;
+  await bot.handleUpdate(photoUpdate() as any);
+  for (let i = 0; i < 90 && outputs.length === 0; i++) await new Promise((r) => setTimeout(r, 1000));
+  console.log("bot replies:", replies.join(" | ") || "(none)");
 
   console.log("\n== checks ==");
   const { readdirSync } = await import("node:fs");
   const listing = readdirSync(projectDir);
   console.log("files:", listing.join(", "));
+  const photoChatAction = chatActions.includes("upload_photo");
+  console.log("chat actions:", chatActions.join(", ") || "(none)");
+  const photoReplyText = replies.join("\n");
   // makeBot() replaces the Core handlers with its own, so agent output and errors
   // arrive as Telegram replies rather than in `outputs`. Judge the turn on both.
-  const agentText = `${outputs.join("\n")}\n${replies.join("\n")}`;
+  const agentText = `${outputs.join("\n")}\n${docReplies.join("\n")}`;
   // A provider-side failure (quota/auth) blocks the "agent replied" assertions only;
   // it is not a bridge defect, so report it as BLOCKED rather than FAIL.
   const providerBlocked = /Insufficient account funds|quota|Unauthorized|401|402/.test(agentText);
@@ -117,6 +152,9 @@ async function main() {
     ["bytes match what Telegram served", readFileSync(join(projectDir, "round-trip.txt")).equals(Buffer.from(FILE_BYTES))],
     ["agent turn completed (no timeout wording)", /ROUND_TRIP|done|here/i.test(agentText) && !/timed out/.test(agentText)],
     ["agent saw the file contents", /ROUND_TRIP/.test(agentText)],
+    ["photo saved as photo.jpg", existsSync(join(projectDir, "photo.jpg"))],
+    ["photo used upload_photo action", photoChatAction],
+    ["photo turn completed", /photo-ok/i.test(photoReplyText)],
   ];
   for (const [name, ok] of checks) {
     const isAgentTurnCheck = name.includes("agent turn completed") || name.includes("agent saw");

@@ -1,5 +1,6 @@
 import type { Client } from "./opencode";
 import { EventBus, type OcEvent } from "./events";
+import { FreeModelSelector } from "./models";
 import type { components } from "./api";
 import type { ChatState } from "./state";
 import { resolve } from "node:path";
@@ -23,6 +24,15 @@ export interface AttachmentInput {
 }
 
 export type AttachWrite = (directory: string, name: string, bytes: Uint8Array) => Promise<void>;
+
+/**
+ * "auto-free"  - chats without an explicit model pick the newest free model that reads
+ *                text and images; a pinned model that vanished upstream is dropped and
+ *                re-selected. This keeps the bridge off metered models (a paid default can
+ *                fail with "Insufficient account funds" when the Zen account has no credit).
+ * "server"     - never set a model; let OpenCode use its own configured default.
+ */
+export type ModelPolicy = "auto-free" | "server";
 
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_QUEUED_ENTRIES = 5;
@@ -70,6 +80,8 @@ export class Core {
     public setState: (chatId: number, s: ChatState) => void,
     private handlersInit: CoreHandlers,
     private attachWrite?: AttachWrite,
+    private modelSelector?: FreeModelSelector,
+    private modelPolicy: ModelPolicy = "auto-free",
   ) {
     this.handlers = handlersInit;
     this.attachWriteFn = attachWrite ?? defaultAttachWrite;
@@ -243,12 +255,13 @@ export class Core {
   }
 
   private async createSession(chatId: number, state: ChatState): Promise<string> {
+    const model = await this.resolveModel(chatId, state);
     const created = await this.client.POST("/api/session", {
       body: {
         title: `tg-${chatId}`,
         location: { directory: state.projectDir },
         ...(state.agent ? { agent: state.agent } : {}),
-        ...(state.model ? { model: state.model } : {}),
+        ...(model ? { model } : {}),
       },
     });
     if (created.error || !created.data?.data) {
@@ -257,11 +270,48 @@ export class Core {
     const sessionID = created.data.data.id;
     const current = this.getState(chatId);
     if (current.projectDir === state.projectDir && current.sessionID === state.sessionID) {
-      this.setState(chatId, { ...current, sessionID });
+      this.setState(chatId, { ...current, sessionID, model: current.model ?? model });
     }
     this.sessionChat.set(sessionID, chatId);
     this.validatedSessions.add(sessionID);
     return sessionID;
+  }
+
+  /**
+   * Decide which model a new session should run on. An explicit choice from the menu wins, but
+   * if it has disappeared upstream it is dropped (and reported) so the chat falls back to the
+   * current free pick rather than failing every prompt. Falls back to the server default when
+   * the model catalogue cannot be read.
+   */
+  private async resolveModel(chatId: number, state: ChatState): Promise<ModelRef | undefined> {
+    if (this.modelPolicy === "server" || !this.modelSelector) return state.model;
+    let available = true;
+    try {
+      available = await this.modelSelector.stillAvailable(state.projectDir, state.model);
+    } catch (error) {
+      console.error("model availability check failed; using server default", error);
+      return state.model;
+    }
+    if (state.model && available) return state.model;
+    if (state.model && !available) {
+      const current = this.getState(chatId);
+      if (current.model === state.model && current.projectDir === state.projectDir) {
+        this.setState(chatId, { ...current, model: undefined });
+      }
+      this.handlers.onError(chatId, `Model ${state.model.providerID}/${state.model.id} is no longer available; switching to an automatic free model.`);
+    }
+    try {
+      const auto = await this.modelSelector.auto(state.projectDir);
+      if (!auto) {
+        // never fall through silently: a missing pick means the server default (a paid
+        // model) would be used, which fails with "Insufficient account funds"
+        this.handlers.onError(chatId, "No free text+image model is available right now; this session uses the server default model.");
+      }
+      return auto;
+    } catch (error) {
+      console.error("free model selection failed; using server default", error);
+      return undefined;
+    }
   }
 
   async listAgents(chatId: number): Promise<AgentInfo[]> {

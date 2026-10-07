@@ -18,6 +18,7 @@ Telegram bridge for [OpenCode](https://opencode.ai) v2 — drive the agent from 
 - `src/core.ts` — session manager, permission routing, execution wait
 - `src/bot.ts` — grammY adapter (commands, inline keyboards, throttled progress)
 - `src/events.ts` — SSE subscriber with reconnect
+- `src/models.ts` — free-model selection (free + text+image + newest release), availability checks
 - `src/format.ts` — HTML escaping, chunking, redaction
 - `src/opencode.ts` — typed API client plus the server-side file write used for attachments
 - `scripts/smoke.ts` — REST smoke test (create session → prompt → messages)
@@ -45,12 +46,26 @@ npm test              # mocked unit/integration tests, no network
 npm run smoke         # REST round-trip against the running OpenCode service
 npm run e2e:attach    # live attachment path: real file write + real agent turn
 npm run e2e:telegram  # full bot path with only the Telegram API stubbed
+npm run e2e:vision    # real PNG through the attachment path; asks the agent for its colour
 ```
 
-The two `e2e` scripts need the OpenCode service and bot credentials from
+The `e2e` scripts need the OpenCode service and bot credentials from
 `~/.config/opencode-tg/env` and create throwaway sessions in a temp project directory, which they
 delete afterwards. If the model provider is out of credit or unauthorized, the agent-turn checks
 report `BLOCKED` and the scripts still exit 0 — a provider problem is not a bridge failure.
+
+## Models
+
+`MODEL_POLICY` controls which model a new session runs on:
+
+- `auto-free` (default) — chats without an explicit choice get the **newest free model that can
+  read text and images**, so the bridge never bills you through a metered default. Selection
+  happens per new session, which means a newly released free model takes over automatically and a
+  model that disappears from the catalogue stops being used. If a model you picked in the menu is
+  removed upstream, it is dropped with a notice and re-selected.
+- `server` — never set a model; OpenCode uses its own configured default.
+
+The model menu marks zero-cost models with `· free`.
 
 ## Config
 
@@ -65,6 +80,7 @@ PROJECT_ALLOWLIST=/home/you/dev,/home/you/work
 # Optional overrides:
 OPENCODE_SERVICE_FILE=/home/you/.config/opencode/service.json
 TG_STATE=/home/you/.config/opencode-tg/state.json
+# MODEL_POLICY=auto-free   # default; "server" disables free-model auto-selection
 ```
 
 The default environment, service, and state files live under `~/.config`. Set `TG_ENV` to use a different environment file. `PROJECT_ALLOWLIST` is required and must contain directories OpenCode is allowed to open.

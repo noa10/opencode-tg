@@ -4,6 +4,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import type { components } from "./api";
 import type { Config } from "./config";
 import { Core, type PermissionReq } from "./core";
+import { isFreeModel } from "./models";
 import { chunk, escapeHtml, redact, toTelegramHtml } from "./format";
 
 type ModelRef = components["schemas"]["Model.Ref"];
@@ -291,7 +292,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     const keyboard = new InlineKeyboard();
     for (const model of models.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)) {
       const marker = selected?.id === model.id && selected.providerID === model.providerID ? "✓ " : "";
-      keyboard.text(buttonLabel(`${marker}${model.name} · ${model.providerID}`), actionData(chatId, {
+      // surface which models are free so an accidental pick cannot bill the account
+      const free = isFreeModel(model as never) ? " · free" : "";
+      keyboard.text(buttonLabel(`${marker}${model.name} · ${model.providerID}${free}`), actionData(chatId, {
         kind: "model-variants",
         id: model.id,
         providerID: model.providerID,

@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config";
 import { makeClient } from "../src/opencode";
 import { EventBus } from "../src/events";
 import { Core, type CoreHandlers } from "../src/core";
+import { FreeModelSelector } from "../src/models";
 import type { ChatState } from "../src/state";
 
 const CHAT_ID = 999_000_1;
@@ -52,6 +53,8 @@ async function main() {
         ),
       );
     },
+    new FreeModelSelector(client, undefined, [config.defaultProject]),
+    config.modelPolicy,
   );
   core.attach();
   events.start();
@@ -63,8 +66,14 @@ async function main() {
   console.log("\n== case 1: document with caption ==");
   const done = core.attachFile(CHAT_ID, { name: "e2e-notes.txt", mime: "text/plain", caption: "Read e2e-notes.txt and reply with only the value of MAGIC_TOKEN and the stated capital, separated by a comma.", bytes });
   console.log("attachFile returned:", await done);
-
-  // --- 2. same file again -> collision-safe name ------------------------------
+  console.log("state after case 1:", JSON.stringify(state));
+  {
+    const sid = state.sessionID;
+    if (sid) {
+      const info = await client.GET("/api/session/{sessionID}", { params: { path: { sessionID: sid } } });
+      console.log("session model:", JSON.stringify(((info.data as any)?.data ?? {}).model));
+    }
+  }
   console.log("\n== case 2: colliding filename ==");
   const second = core.attachFile(CHAT_ID, { name: "e2e-notes.txt", mime: "text/plain", caption: "Reply with only: second", bytes });
   console.log("attachFile returned:", await second);

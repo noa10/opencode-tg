@@ -22,6 +22,7 @@ export interface Config {
   projectAllowlist: string[];
   defaultProject: string;
   statePath: string;
+  modelPolicy: "auto-free" | "server";
 }
 
 export function readEnvFile(path: string): Record<string, string> {
@@ -64,5 +65,6 @@ export function loadConfig(): Config {
     projectAllowlist: allowlist,
     defaultProject: allowlist[0],
     statePath: normalizePath(env.TG_STATE ?? resolve(homedir(), ".config/opencode-tg/state.json")),
+    modelPolicy: env.MODEL_POLICY === "server" ? "server" : "auto-free",
   };
 }

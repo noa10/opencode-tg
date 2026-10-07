@@ -53,6 +53,7 @@ test("concurrent first prompts share a single newly created session", async () =
   }, { projectDir: "/repo" });
   const first = core.ensureSession(USER_ID);
   const second = core.ensureSession(USER_ID);
+  await new Promise((resolve) => setTimeout(resolve, 0)); // let the shared creation reach the client
   assert.equal(postCount, 1, "parallel updates should start only one session creation request");
   releaseCreation?.();
   assert.deepEqual(await Promise.all([first, second]), ["shared-session", "shared-session"]);
