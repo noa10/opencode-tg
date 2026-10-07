@@ -1,6 +1,8 @@
+import { homedir } from "node:os";
 import { loadConfig } from "./config";
-import { makeClient } from "./opencode";
+import { makeClient, writeProjectFile } from "./opencode";
 import { EventBus } from "./events";
+import { FreeModelSelector } from "./models";
 import { Core } from "./core";
 import { State } from "./state";
 import { makeBot } from "./bot";
@@ -28,6 +30,15 @@ async function main() {
       onDone: () => {},
       onError: () => {},
     },
+    (directory, name, bytes) =>
+      writeProjectFile(
+        { url: config.opencodeUrl, user: config.opencodeUser, password: config.opencodePassword },
+        directory,
+        name,
+        bytes,
+      ),
+    new FreeModelSelector(client, undefined, [config.defaultProject, homedir()]),
+    config.modelPolicy,
   );
   core.restoreSessions(config.allowedIds);
   const bot = await makeBot(config, core);

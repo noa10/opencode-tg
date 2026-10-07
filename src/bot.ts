@@ -4,6 +4,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import type { components } from "./api";
 import type { Config } from "./config";
 import { Core, type PermissionReq } from "./core";
+import { isFreeModel } from "./models";
 import { chunk, escapeHtml, redact, toTelegramHtml } from "./format";
 
 type ModelRef = components["schemas"]["Model.Ref"];
@@ -16,6 +17,7 @@ type MenuAction =
   | { readonly kind: "models"; readonly page: number }
   | { readonly kind: "model-variants"; readonly id: string; readonly providerID: string; readonly page: number }
   | { readonly kind: "select-model"; readonly model: ModelRef }
+  | { readonly kind: "auto-model" }
   | { readonly kind: "projects" }
   | { readonly kind: "select-project"; readonly directory: string }
   | { readonly kind: "sessions"; readonly page: number }
@@ -143,6 +145,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     void core.sendPrompt(chatId, text).then((result) => {
       if (result === "queued") {
         return bot.api.sendMessage(chatId, "⏳ Still working on the previous prompt; yours is queued.");
+      }
+      if (result === "dropped") {
+        return bot.api.sendMessage(chatId, "⚠️ Queue is full — drop the pending work or wait for the current turn to finish.");
       }
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -288,7 +293,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     const keyboard = new InlineKeyboard();
     for (const model of models.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)) {
       const marker = selected?.id === model.id && selected.providerID === model.providerID ? "✓ " : "";
-      keyboard.text(buttonLabel(`${marker}${model.name} · ${model.providerID}`), actionData(chatId, {
+      // surface which models are free so an accidental pick cannot bill the account
+      const free = isFreeModel(model) ? " · free" : "";
+      keyboard.text(buttonLabel(`${marker}${model.name} · ${model.providerID}${free}`), actionData(chatId, {
         kind: "model-variants",
         id: model.id,
         providerID: model.providerID,
@@ -301,8 +308,11 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       keyboard.row();
     }
     keyboard.text("Back", actionData(chatId, { kind: "home" }));
+    const automatic = core.getState(chatId).modelAuto === true;
+    keyboard.row();
+    keyboard.text(automatic ? "✓ Automatic (newest free)" : "Automatic (newest free)", actionData(chatId, { kind: "auto-model" }));
     const text = models.length
-      ? `<b>Choose a model</b> (page ${currentPage + 1}/${pageCount})\nChoose a model to see its available variants.`
+      ? `<b>Choose a model</b> (page ${currentPage + 1}/${pageCount})\nChoose a model to see its available variants. Automatic follows the newest free model that reads text and images.`
       : "No enabled models are available for this project. OpenCode model availability depends on its provider setup.";
     return { text, keyboard };
   }
@@ -418,6 +428,10 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       }
       case "models":
         await editScreen(ctx, await modelScreen(chatId, action.page));
+        return;
+      case "auto-model":
+        core.setAutoModel(chatId);
+        await showHome(ctx, chatId, "Back on automatic: the next session uses the newest free model that reads text and images.");
         return;
       case "model-variants":
         await editScreen(ctx, await modelVariantScreen(chatId, action.id, action.providerID, action.page));
@@ -543,7 +557,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     }
   });
 
-  bot.on("message:text", async (ctx, next) => {
+  bot.on(["message:text", "message:document", "message:photo", "message:video", "message:audio", "message:voice"], async (ctx, next) => {
     if (Date.now() / 1000 - (ctx.message.date ?? 0) > FRESH_MS / 1000) return;
     await next();
   });
@@ -721,6 +735,66 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     void bot.api.sendChatAction(chatId, "typing").catch((error: unknown) => console.error("typing indicator failed", error));
     startPrompt(chatId, text);
   }));
+
+  const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+  type AttachmentMeta = { fileId: string; name: string; mime?: string; size?: number; caption?: string; chatAction: "upload_document" | "upload_photo" };
+
+  // Only the five message types registered below reach here, so this always resolves.
+  function attachmentMeta(message: any): AttachmentMeta {
+    if (message.document) {
+      return { fileId: message.document.file_id, name: message.document.file_name ?? "document", mime: message.document.mime_type, size: message.document.file_size, caption: message.caption, chatAction: "upload_document" };
+    }
+    if (Array.isArray(message.photo) && message.photo.length > 0) {
+      const largest = message.photo[message.photo.length - 1];
+      return { fileId: largest.file_id, name: "photo.jpg", mime: "image/jpeg", size: largest.file_size, caption: message.caption, chatAction: "upload_photo" };
+    }
+    if (message.video) {
+      return { fileId: message.video.file_id, name: message.video.file_name ?? "video.mp4", mime: message.video.mime_type, size: message.video.file_size, caption: message.caption, chatAction: "upload_document" };
+    }
+    if (message.audio) {
+      return { fileId: message.audio.file_id, name: message.audio.file_name ?? "audio.mp3", mime: message.audio.mime_type, size: message.audio.file_size, caption: message.caption, chatAction: "upload_document" };
+    }
+    return { fileId: message.voice.file_id, name: `voice-${message.date ?? Date.now()}.oga`, mime: message.voice.mime_type ?? "audio/ogg", size: message.voice.file_size, caption: message.caption, chatAction: "upload_document" };
+  }
+
+  async function handleAttachment(ctx: Context): Promise<void> {
+    const chatId = ctx.chat?.id;
+    if (chatId == null) return;
+    try {
+      const meta = attachmentMeta(ctx.message);
+      if (typeof meta.size === "number" && meta.size > MAX_ATTACHMENT_BYTES) {
+        await ctx.reply("File is too large — maximum is 20 MB.");
+        return;
+      }
+      void bot.api.sendChatAction(chatId, meta.chatAction).catch(() => {});
+      const file = await ctx.getFile();
+      if (!file.file_path) throw new Error("Telegram returned no file path");
+      const fromTelegram = typeof telegramApiFetch === "function" ? telegramApiFetch : fetch;
+      const url = `https://api.telegram.org/file/bot${config.tgToken}/${file.file_path}`;
+      const res = await fromTelegram(url);
+      if (!res.ok) throw new Error(`Telegram download failed: ${res.status}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+        await ctx.reply("File is too large — maximum is 20 MB.");
+        return;
+      }
+      const result = await core.attachFile(chatId, { name: meta.name, mime: meta.mime, caption: meta.caption, bytes });
+      if (result === "queued") {
+        await ctx.reply("⏳ Still working on the previous prompt; the attachment is queued.");
+      } else if (result === "dropped") {
+        await ctx.reply("⚠️ Queue is full — drop the pending work or wait for the current turn to finish.");
+      }
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      console.error("attachment handling failed", error);
+      await ctx.reply(`⚠️ ${escapeHtml(redact(error.message))}`, { parse_mode: "HTML" }).catch(() => {});
+    }
+  }
+
+  for (const type of ["message:document", "message:photo", "message:video", "message:audio", "message:voice"] as const) {
+    bot.on(type, guard(async (ctx) => handleAttachment(ctx)));
+  }
 
   void bot.api.setMyCommands([
     { command: "menu", description: "Open controls for agent, model, and sessions" },

@@ -18,8 +18,55 @@ Telegram bridge for [OpenCode](https://opencode.ai) v2 — drive the agent from 
 - `src/core.ts` — session manager, permission routing, execution wait
 - `src/bot.ts` — grammY adapter (commands, inline keyboards, throttled progress)
 - `src/events.ts` — SSE subscriber with reconnect
+- `src/models.ts` — free-model selection (free + text+image + newest release), availability checks
 - `src/format.ts` — HTML escaping, chunking, redaction
+- `src/opencode.ts` — typed API client plus the server-side file write used for attachments
 - `scripts/smoke.ts` — REST smoke test (create session → prompt → messages)
+- `scripts/e2e-attach.ts` — live attachment path against the running service (real write + agent turn)
+- `scripts/e2e-telegram.ts` — full bot path with a stubbed Telegram API (real bot, real service)
+
+## Attachments
+
+Send a document, photo, video, audio file, or voice note to the bot and it is saved into the
+active project's directory; the caption (or "Please review this file.") becomes the prompt and
+the agent reads the saved file with its normal tools. Files above 20 MB are rejected — that is
+also Telegram's bot download limit. No transcription for voice notes.
+
+Limits: stickers, animations and video notes are not handled. A multi-photo album arrives as
+separate messages, so each image becomes its own prompt and only the one carrying the caption has
+an instruction attached. The queue holds at most 5 pending items per chat; beyond that new items
+are dropped with a notice rather than kept in memory. Uploaded files land in the project's working
+directory and are never cleaned up.
+
+## Verifying a change
+
+```
+npm run typecheck     # tsc --noEmit
+npm test              # mocked unit/integration tests, no network
+npm run smoke         # REST round-trip against the running OpenCode service
+npm run e2e:attach    # live attachment path: real file write + real agent turn
+npm run e2e:telegram  # full bot path with only the Telegram API stubbed
+npm run e2e:vision    # real PNG through the attachment path; asks the agent for its colour
+```
+
+The `e2e` scripts need the OpenCode service and bot credentials from
+`~/.config/opencode-tg/env` and create throwaway sessions in a temp project directory, which they
+delete afterwards. If the model provider is out of credit or unauthorized, the agent-turn checks
+report `BLOCKED` and the scripts still exit 0 — a provider problem is not a bridge failure.
+
+## Models
+
+`MODEL_POLICY` controls which model a new session runs on:
+
+- `auto-free` (default) — a chat on **automatic** gets the **newest free model that can read text
+  and images**, so the bridge never bills you through a metered default. The pick is re-evaluated
+  for every new session, so a newly released free model takes over automatically and a model that
+  disappears from the catalogue stops being used. A model you choose in the menu is sticky: it is
+  kept until it disappears upstream, at which point it is dropped with a notice and re-selected.
+  The model menu has an "Automatic (newest free)" entry to go back to rotation.
+- `server` — never set a model; OpenCode uses its own configured default.
+
+The model menu marks zero-cost models with `· free`.
 
 ## Config
 
@@ -34,6 +81,7 @@ PROJECT_ALLOWLIST=/home/you/dev,/home/you/work
 # Optional overrides:
 OPENCODE_SERVICE_FILE=/home/you/.config/opencode/service.json
 TG_STATE=/home/you/.config/opencode-tg/state.json
+# MODEL_POLICY=auto-free   # default; "server" disables free-model auto-selection
 ```
 
 The default environment, service, and state files live under `~/.config`. Set `TG_ENV` to use a different environment file. `PROJECT_ALLOWLIST` is required and must contain directories OpenCode is allowed to open.

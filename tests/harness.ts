@@ -14,6 +14,7 @@ export type HarnessOptions = {
   readonly runCommand?: (...args: [number, string, string]) => Promise<"completed" | "busy" | "failed">;
   readonly sendPrompt?: (chatId: number, text: string) => Promise<string | null>;
   readonly pendingCommandTtlMs?: number;
+  readonly attachFile?: Core["attachFile"];
 };
 
 export const USER_ID = 71;
@@ -70,6 +71,12 @@ export async function createHarness(options: HarnessOptions = {}) {
     const method = new URL(requestUrl).pathname.split("/").at(-1) ?? "";
     const payload = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
     calls.push({ method, payload });
+    if (typeof input === "string" && input.includes("/file/bot")) {
+      return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
+    }
+    if (method === "getFile") {
+      return Response.json({ ok: true, result: { file_id: "file-1", file_unique_id: "u1", file_path: "documents/file_1.bin" } });
+    }
     if (method === "setMyCommands" && options.failSetMyCommands) {
       return Response.json({ ok: false, error_code: 500, description: "Telegram unavailable" });
     }
@@ -110,6 +117,7 @@ export async function createHarness(options: HarnessOptions = {}) {
     interrupt: async () => true,
     runCommand: options.runCommand ?? (async () => "completed"),
     sendPrompt: options.sendPrompt ?? (async () => null),
+    attachFile: options.attachFile ?? (async () => null),
     permissionReply: async () => true,
   } as unknown as Core;
   const bot = await makeBot(config, core, telegramFetch, { pendingCommandTtlMs: options.pendingCommandTtlMs });
@@ -126,6 +134,30 @@ export function callbackDataFor(calls: TelegramCall[], buttonText: string): stri
   return button.callback_data;
 }
 
+export function updateDocumentMessage(
+  updateID: number,
+  options: { fileSize?: number; caption?: string; userID?: number } = {},
+) {
+  const userID = options.userID ?? USER_ID;
+  return {
+    update_id: updateID,
+    message: {
+      message_id: updateID,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: userID, type: "private" as const },
+      from: { id: userID, is_bot: false, first_name: "Tester" },
+      caption: options.caption,
+      document: {
+        file_id: "file-1",
+        file_unique_id: "u1",
+        file_name: "notes.txt",
+        mime_type: "text/plain",
+        ...(options.fileSize !== undefined ? { file_size: options.fileSize } : {}),
+      },
+    },
+  };
+}
+
 export async function captureConsoleErrors<T>(run: () => Promise<T>): Promise<{ readonly result: T; readonly messages: readonly string[] }> {
   const messages: string[] = [];
   const original = console.error;
@@ -137,7 +169,7 @@ export async function captureConsoleErrors<T>(run: () => Promise<T>): Promise<{ 
   }
 }
 
-export function createCore(client: Partial<Client>, initialState: ChatState) {
+export function createCore(client: Partial<Client>, initialState: ChatState, attachWrite?: import("../src/core").AttachWrite) {
   let state = initialState;
   const handlers: CoreHandlers = {
     onPermission: () => {},
@@ -151,6 +183,7 @@ export function createCore(client: Partial<Client>, initialState: ChatState) {
     () => state,
     (_chatId, nextState) => { state = nextState; },
     handlers,
+    attachWrite,
   );
   return { core, getState: () => state };
 }
