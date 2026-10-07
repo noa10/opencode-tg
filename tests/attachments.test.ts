@@ -79,6 +79,54 @@ test("an uploaded document is written to the project dir and referenced in the p
   }
 });
 
+test("a failed turn reports the provider error instead of a generic timeout", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
+  const release = keepAlive();
+  const errors: string[] = [];
+  let promptedSession: string | undefined;
+  const handlers: CoreHandlers = {
+    onPermission: () => {},
+    onProgress: () => {},
+    onDone: () => {},
+    onError: (_c, text) => { errors.push(text); },
+  };
+  const client = {
+    GET: async (path: string) => {
+      if (path === "/api/session/{sessionID}/message") {
+        return {
+          data: {
+            data: [{
+              type: "assistant",
+              content: [],
+              finish: "error",
+              error: { type: "provider.quota", message: "Upstream request failed: Insufficient account funds", status: 402 },
+            }],
+          },
+          error: undefined,
+        };
+      }
+      return { data: { data: { id: "session-1", location: { directory } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { params?: { path?: { sessionID?: string } } }) => {
+      if (path === "/api/session/{sessionID}/prompt") promptedSession = options?.params?.path?.sessionID;
+      return { data: { data: true }, error: undefined, response: new Response(null, { status: 200 }) };
+    },
+  } as unknown as Partial<Client>;
+
+  try {
+    const { core, emit } = coreWithEvents(client, { sessionID: "session-1", projectDir: directory }, handlers);
+    const done = core.attachFile(USER_ID, { name: "x.txt", caption: "go", bytes: new Uint8Array([1]) });
+    await waitFor(() => promptedSession !== undefined, "the prompt to be sent");
+    emit({ type: "session.execution.failed", data: { sessionID: promptedSession } } as OcEvent);
+    assert.equal(await done, null);
+    assert.match(errors.join("\n"), /Insufficient account funds/);
+    assert.doesNotMatch(errors.join("\n"), /timed out/);
+  } finally {
+    release();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("an all-dots filename is replaced instead of escaping the project dir", async () => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-tg-attach-"));
   const release = keepAlive();

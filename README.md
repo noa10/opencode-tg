@@ -21,6 +21,8 @@ Telegram bridge for [OpenCode](https://opencode.ai) v2 — drive the agent from 
 - `src/format.ts` — HTML escaping, chunking, redaction
 - `src/opencode.ts` — typed API client plus the server-side file write used for attachments
 - `scripts/smoke.ts` — REST smoke test (create session → prompt → messages)
+- `scripts/e2e-attach.ts` — live attachment path against the running service (real write + agent turn)
+- `scripts/e2e-telegram.ts` — full bot path with a stubbed Telegram API (real bot, real service)
 
 ## Attachments
 
@@ -34,6 +36,21 @@ separate messages, so each image becomes its own prompt and only the one carryin
 an instruction attached. The queue holds at most 5 pending items per chat; beyond that new items
 are dropped with a notice rather than kept in memory. Uploaded files land in the project's working
 directory and are never cleaned up.
+
+## Verifying a change
+
+```
+npm run typecheck     # tsc --noEmit
+npm test              # mocked unit/integration tests, no network
+npm run smoke         # REST round-trip against the running OpenCode service
+npm run e2e:attach    # live attachment path: real file write + real agent turn
+npm run e2e:telegram  # full bot path with only the Telegram API stubbed
+```
+
+The two `e2e` scripts need the OpenCode service and bot credentials from
+`~/.config/opencode-tg/env` and create throwaway sessions in a temp project directory, which they
+delete afterwards. If the model provider is out of credit or unauthorized, the agent-turn checks
+report `BLOCKED` and the scripts still exit 0 — a provider problem is not a bridge failure.
 
 ## Config
 

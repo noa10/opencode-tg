@@ -395,7 +395,8 @@ export class Core {
           }
           const retrySucceeded = await retryDone;
           if (!retrySucceeded) {
-            this.handlers.onError(chatId, "command execution timed out or failed");
+            const detail = await this.lastAssistantError(sessionID);
+            this.handlers.onError(chatId, detail ? `command failed: ${detail.replace("execution failed: ", "")}` : "command execution timed out or failed");
             return "failed";
           }
           this.handlers.onDone(chatId, this.lastText.get(sessionID) ?? `/${name} completed.`);
@@ -408,7 +409,8 @@ export class Core {
         }
         const succeeded = await done;
         if (!succeeded) {
-          this.handlers.onError(chatId, "command execution timed out or failed");
+          const detail = await this.lastAssistantError(sessionID);
+          this.handlers.onError(chatId, detail ? `command failed: ${detail.replace("execution failed: ", "")}` : "command execution timed out or failed");
           return "failed";
         }
         this.handlers.onDone(chatId, this.lastText.get(sessionID) ?? `/${name} completed.`);
@@ -534,7 +536,7 @@ export class Core {
       }
       const retryOk = await retryDone;
       if (!retryOk) {
-        this.handlers.onError(chatId, "execution timed out or failed");
+        await this.reportExecutionFailure(sessionID, chatId);
         return;
       }
       return this.finishWithMessages(sessionID, chatId);
@@ -547,10 +549,36 @@ export class Core {
 
     const ok = await done;
     if (!ok) {
-      this.handlers.onError(chatId, "execution timed out or failed");
+      await this.reportExecutionFailure(sessionID, chatId);
       return;
     }
     return this.finishWithMessages(sessionID, chatId);
+  }
+
+  /**
+   * A turn can end without succeeding for reasons other than our own timeout
+   * (provider quota, auth, model errors). Prefer the assistant message's error
+   * over a generic "failed", so the user sees the actual cause.
+   */
+  private async reportExecutionFailure(sessionID: string, chatId: number): Promise<void> {
+    const detail = await this.lastAssistantError(sessionID);
+    this.handlers.onError(chatId, detail ?? "execution timed out or failed");
+  }
+
+  private async lastAssistantError(sessionID: string): Promise<string | undefined> {
+    try {
+      const msgs = await this.client.GET("/api/session/{sessionID}/message", {
+        params: { path: { sessionID } },
+      });
+      const list = (msgs.data as any)?.data ?? msgs.data ?? [];
+      const assistant = list.find((m: any) => m.type === "assistant");
+      const error = assistant?.error;
+      if (!error) return undefined;
+      const message = typeof error === "string" ? error : String(error.message ?? JSON.stringify(error));
+      return message ? `execution failed: ${message}` : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async finishWithMessages(sessionID: string, chatId: number) {
