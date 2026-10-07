@@ -10,6 +10,12 @@ export interface ChatState {
   projectDir: string;
   agent?: string;
   model?: ModelRef;
+  /**
+   * True when `model` was picked automatically (newest free text+image model) rather than chosen
+   * by the user. Automatic picks are re-evaluated for every new session, so a newer free release
+   * takes over; an explicit user pick stays until the model disappears upstream.
+   */
+  modelAuto?: boolean;
 }
 
 export class State {

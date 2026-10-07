@@ -270,7 +270,14 @@ export class Core {
     const sessionID = created.data.data.id;
     const current = this.getState(chatId);
     if (current.projectDir === state.projectDir && current.sessionID === state.sessionID) {
-      this.setState(chatId, { ...current, sessionID, model: current.model ?? model });
+      // record the model actually used so /status and the menu can show it; `modelAuto` keeps
+      // telling an automatic pick apart from a user choice (see ChatState)
+      this.setState(chatId, {
+        ...current,
+        sessionID,
+        model: current.model ?? model,
+        modelAuto: current.model ? current.modelAuto : true,
+      });
     }
     this.sessionChat.set(sessionID, chatId);
     this.validatedSessions.add(sessionID);
@@ -285,33 +292,50 @@ export class Core {
    */
   private async resolveModel(chatId: number, state: ChatState): Promise<ModelRef | undefined> {
     if (this.modelPolicy === "server" || !this.modelSelector) return state.model;
-    let available = true;
-    try {
-      available = await this.modelSelector.stillAvailable(state.projectDir, state.model);
-    } catch (error) {
-      console.error("model availability check failed; using server default", error);
-      return state.model;
-    }
-    if (state.model && available) return state.model;
-    if (state.model && !available) {
+
+    // An explicit user pick is sticky: only re-check that it still exists upstream.
+    if (state.model && state.modelAuto !== true) {
+      try {
+        if (await this.modelSelector.stillAvailable(state.projectDir, state.model)) return state.model;
+      } catch (error) {
+        console.error("model availability check failed; leaving the session on the server default", error);
+        return undefined;
+      }
       const current = this.getState(chatId);
       if (current.model === state.model && current.projectDir === state.projectDir) {
-        this.setState(chatId, { ...current, model: undefined });
+        this.setState(chatId, { ...current, model: undefined, modelAuto: undefined });
       }
       this.handlers.onError(chatId, `Model ${state.model.providerID}/${state.model.id} is no longer available; switching to an automatic free model.`);
+      return this.autoModel(chatId, state);
     }
+
+    // Automatic pick (or none): re-evaluate so a newer free release takes over.
+    return this.autoModel(chatId, state);
+  }
+
+  private async autoModel(chatId: number, state: ChatState): Promise<ModelRef | undefined> {
+    let picked: ModelRef | undefined;
     try {
-      const auto = await this.modelSelector.auto(state.projectDir);
-      if (!auto) {
-        // never fall through silently: a missing pick means the server default (a paid
-        // model) would be used, which fails with "Insufficient account funds"
-        this.handlers.onError(chatId, "No free text+image model is available right now; this session uses the server default model.");
-      }
-      return auto;
+      picked = await this.modelSelector!.auto(state.projectDir);
     } catch (error) {
       console.error("free model selection failed; using server default", error);
       return undefined;
     }
+    if (!picked) {
+      // never fall through silently: a missing pick means the server default (a paid
+      // model) would be used, which fails with "Insufficient account funds"
+      this.handlers.onError(chatId, "No free text+image model is available right now; this session uses the server default model.");
+      return undefined;
+    }
+    const current = this.getState(chatId);
+    if (
+      current.projectDir === state.projectDir &&
+      current.sessionID === state.sessionID &&
+      (current.model?.id !== picked.id || current.modelAuto !== true)
+    ) {
+      this.setState(chatId, { ...current, model: picked, modelAuto: true });
+    }
+    return picked;
   }
 
   async listAgents(chatId: number): Promise<AgentInfo[]> {
@@ -377,8 +401,14 @@ export class Core {
     }
     if (response.error) return false;
     const current = this.getState(chatId);
-    if (current.projectDir === projectDir) this.setState(chatId, { ...current, model });
+    if (current.projectDir === projectDir) this.setState(chatId, { ...current, model, modelAuto: false });
     return true;
+  }
+
+  /** Put the chat back on automatic selection so newer free models can take over again. */
+  setAutoModel(chatId: number) {
+    const current = this.getState(chatId);
+    this.setState(chatId, { ...current, model: undefined, modelAuto: true });
   }
 
   async openSession(chatId: number, sessionID: string, allowedDirectories: readonly string[]): Promise<boolean> {
@@ -445,8 +475,8 @@ export class Core {
           }
           const retrySucceeded = await retryDone;
           if (!retrySucceeded) {
-            const detail = await this.lastAssistantError(sessionID);
-            this.handlers.onError(chatId, detail ? `command failed: ${detail.replace("execution failed: ", "")}` : "command execution timed out or failed");
+            const reason = await this.lastAssistantError(sessionID);
+            this.handlers.onError(chatId, reason ? `command failed: ${reason}` : "command execution timed out or failed");
             return "failed";
           }
           this.handlers.onDone(chatId, this.lastText.get(sessionID) ?? `/${name} completed.`);
@@ -459,8 +489,8 @@ export class Core {
         }
         const succeeded = await done;
         if (!succeeded) {
-          const detail = await this.lastAssistantError(sessionID);
-          this.handlers.onError(chatId, detail ? `command failed: ${detail.replace("execution failed: ", "")}` : "command execution timed out or failed");
+          const reason = await this.lastAssistantError(sessionID);
+          this.handlers.onError(chatId, reason ? `command failed: ${reason}` : "command execution timed out or failed");
           return "failed";
         }
         this.handlers.onDone(chatId, this.lastText.get(sessionID) ?? `/${name} completed.`);
@@ -611,21 +641,20 @@ export class Core {
    * over a generic "failed", so the user sees the actual cause.
    */
   private async reportExecutionFailure(sessionID: string, chatId: number): Promise<void> {
-    const detail = await this.lastAssistantError(sessionID);
-    this.handlers.onError(chatId, detail ?? "execution timed out or failed");
+    const reason = await this.lastAssistantError(sessionID);
+    this.handlers.onError(chatId, reason ? `execution failed: ${reason}` : "execution timed out or failed");
   }
 
   private async lastAssistantError(sessionID: string): Promise<string | undefined> {
     try {
       const msgs = await this.client.GET("/api/session/{sessionID}/message", {
-        params: { path: { sessionID } },
+        params: { path: { sessionID }, query: { order: "desc" } },
       });
       const list = (msgs.data as any)?.data ?? msgs.data ?? [];
       const assistant = list.find((m: any) => m.type === "assistant");
       const error = assistant?.error;
       if (!error) return undefined;
-      const message = typeof error === "string" ? error : String(error.message ?? JSON.stringify(error));
-      return message ? `execution failed: ${message}` : undefined;
+      return typeof error === "string" ? error : String(error.message ?? JSON.stringify(error));
     } catch {
       return undefined;
     }
@@ -633,8 +662,9 @@ export class Core {
 
   private async finishWithMessages(sessionID: string, chatId: number) {
     try {
+      // order desc = newest first, so `.find` is the current turn and not an old one
       const msgs = await this.client.GET("/api/session/{sessionID}/message", {
-        params: { path: { sessionID } },
+        params: { path: { sessionID }, query: { order: "desc" } },
       });
       const list = (msgs.data as any)?.data ?? msgs.data ?? [];
       const assistant = list.find((m: any) => m.type === "assistant");

@@ -8,7 +8,7 @@ import {
   pickFreeVisionModel,
   supportsTextAndImage,
 } from "../src/models";
-import type { Core } from "../src/core";
+import { Core, type CoreHandlers } from "../src/core";
 import type { Client } from "../src/opencode";
 import { createCore, USER_ID } from "./harness";
 
@@ -84,6 +84,125 @@ test("the selector reports availability and caches the catalogue", async () => {
   assert.equal(await selector.stillAvailable("/repo", { id: "gone", providerID: "opencode" }), false);
   assert.equal(calls, 1, "one catalogue fetch serves both calls");
 });
+
+test("an automatic pick rotates to a newer free release on the next session", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  let pick: { id: string; providerID: string } = { id: "free-v1", providerID: "opencode" };
+  const selector = { auto: async () => pick, stillAvailable: async () => true };
+  const { core, getState } = createCore(
+    {
+      POST: async (path: string, options?: { body?: unknown }) => {
+        if (path === "/api/session") {
+          bodies.push(options?.body as Record<string, unknown>);
+          return { data: { data: { id: `s-${bodies.length}` } }, error: undefined };
+        }
+        return { data: { data: true }, error: undefined };
+      },
+    },
+    { projectDir: "/repo" },
+  );
+  (core as unknown as { modelSelector: unknown }).modelSelector = selector;
+
+  await core.newSession(USER_ID);
+  assert.deepEqual(bodies[0]?.model, { id: "free-v1", providerID: "opencode" });
+  assert.equal(getState().modelAuto, true, "the pick is marked automatic");
+
+  // a newer free model is published upstream
+  pick = { id: "free-v2", providerID: "opencode" };
+  await core.newSession(USER_ID);
+  assert.deepEqual(bodies[1]?.model, { id: "free-v2", providerID: "opencode" }, "a newer release takes over");
+  assert.deepEqual(getState().model, { id: "free-v2", providerID: "opencode" });
+});
+
+test("an explicit user pick is never overridden by rotation", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  let pick: { id: string; providerID: string } = { id: "free-v2", providerID: "opencode" };
+  const selector = { auto: async () => pick, stillAvailable: async () => true };
+  const { core, getState } = createCore(
+    {
+      GET: async () => ({ data: { data: { id: "s-0", location: { directory: "/repo" } } }, error: undefined }),
+      POST: async (path: string, options?: { body?: unknown }) => {
+        if (path === "/api/session") {
+          bodies.push(options?.body as Record<string, unknown>);
+          return { data: { data: { id: `s-${bodies.length}` } }, error: undefined };
+        }
+        if (path === "/api/session/{sessionID}/model") return { data: { data: true }, error: undefined };
+        return { data: { data: true }, error: undefined };
+      },
+    },
+    { projectDir: "/repo", sessionID: "s-0" },
+  );
+  (core as unknown as { modelSelector: unknown }).modelSelector = selector;
+
+  assert.equal(await core.setModel(USER_ID, { id: "chosen", providerID: "opencode" }), true);
+  assert.equal(getState().modelAuto, false, "a menu pick is not automatic");
+
+  pick = { id: "free-v3", providerID: "opencode" };
+  await core.newSession(USER_ID);
+  assert.deepEqual(bodies.at(-1)?.model, { id: "chosen", providerID: "opencode" }, "rotation must not override a user pick");
+});
+
+test("setAutoModel puts the chat back on rotation", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  let pick: { id: string; providerID: string } = { id: "free-v9", providerID: "opencode" };
+  const selector = { auto: async () => pick, stillAvailable: async () => true };
+  const { core, getState } = createCore(
+    {
+      POST: async (path: string, options?: { body?: unknown }) => {
+        if (path === "/api/session") {
+          bodies.push(options?.body as Record<string, unknown>);
+          return { data: { data: { id: `s-${bodies.length}` } }, error: undefined };
+        }
+        return { data: { data: true }, error: undefined };
+      },
+    },
+    { projectDir: "/repo", sessionID: "s-0", model: { id: "chosen", providerID: "opencode" }, modelAuto: false },
+  );
+  (core as unknown as { modelSelector: unknown }).modelSelector = selector;
+  core.setAutoModel(USER_ID);
+  assert.equal(getState().model, undefined);
+  assert.equal(getState().modelAuto, true);
+  await core.newSession(USER_ID);
+  assert.deepEqual(bodies.at(-1)?.model, { id: "free-v9", providerID: "opencode" });
+});
+
+test("the newest assistant message is read with an explicit order", async () => {
+  const queries: Array<unknown> = [];
+  let promptedSession: string | undefined;
+  const handlers: CoreHandlers = { onPermission: () => {}, onProgress: () => {}, onDone: () => {}, onError: () => {} };
+  const client = {
+    GET: async (path: string, options?: { params?: { query?: unknown } }) => {
+      if (path === "/api/session/{sessionID}/message") {
+        queries.push(options?.params?.query);
+        return { data: { data: [{ type: "assistant", content: [{ type: "text", text: "newest" }] }] }, error: undefined };
+      }
+      return { data: { data: { id: "s1", location: { directory: "/repo" } } }, error: undefined };
+    },
+    POST: async (path: string, options?: { params?: { path?: { sessionID?: string } } }) => {
+      if (path === "/api/session/{sessionID}/prompt") promptedSession = options?.params?.path?.sessionID;
+      return { data: { data: true }, error: undefined };
+    },
+  } as unknown as Partial<Client>;
+  const { core, emit } = coreWithEventsForModel(client, { sessionID: "s1", projectDir: "/repo" }, handlers);
+  const done = core.sendPrompt(USER_ID, "hi");
+  while (promptedSession === undefined) await new Promise((r) => setTimeout(r, 5));
+  emit({ type: "session.execution.succeeded", data: { sessionID: promptedSession } });
+  await done;
+  assert.deepEqual(queries, [{ order: "desc" }], "newest-first must be requested explicitly");
+});
+
+function coreWithEventsForModel(client: Partial<Client>, state: { sessionID?: string; projectDir: string }, handlers: CoreHandlers) {
+  let onEvent: ((event: { type: string; data?: unknown }) => void) | undefined;
+  const core = new Core(
+    client as Client,
+    { on: (cb: (event: { type: string; data?: unknown }) => void) => { onEvent = cb; } } as never,
+    () => state,
+    (_c, s) => { state = s; },
+    handlers,
+  );
+  core.attach();
+  return { core, emit: (e: { type: string; data?: unknown }) => onEvent?.(e) };
+}
 
 test("a new session gets the auto-selected free model when none is pinned", async () => {
   let body: Record<string, unknown> | undefined;

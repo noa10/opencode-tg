@@ -58,11 +58,12 @@ report `BLOCKED` and the scripts still exit 0 — a provider problem is not a br
 
 `MODEL_POLICY` controls which model a new session runs on:
 
-- `auto-free` (default) — chats without an explicit choice get the **newest free model that can
-  read text and images**, so the bridge never bills you through a metered default. Selection
-  happens per new session, which means a newly released free model takes over automatically and a
-  model that disappears from the catalogue stops being used. If a model you picked in the menu is
-  removed upstream, it is dropped with a notice and re-selected.
+- `auto-free` (default) — a chat on **automatic** gets the **newest free model that can read text
+  and images**, so the bridge never bills you through a metered default. The pick is re-evaluated
+  for every new session, so a newly released free model takes over automatically and a model that
+  disappears from the catalogue stops being used. A model you choose in the menu is sticky: it is
+  kept until it disappears upstream, at which point it is dropped with a notice and re-selected.
+  The model menu has an "Automatic (newest free)" entry to go back to rotation.
 - `server` — never set a model; OpenCode uses its own configured default.
 
 The model menu marks zero-cost models with `· free`.

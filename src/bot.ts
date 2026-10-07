@@ -17,6 +17,7 @@ type MenuAction =
   | { readonly kind: "models"; readonly page: number }
   | { readonly kind: "model-variants"; readonly id: string; readonly providerID: string; readonly page: number }
   | { readonly kind: "select-model"; readonly model: ModelRef }
+  | { readonly kind: "auto-model" }
   | { readonly kind: "projects" }
   | { readonly kind: "select-project"; readonly directory: string }
   | { readonly kind: "sessions"; readonly page: number }
@@ -293,7 +294,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     for (const model of models.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)) {
       const marker = selected?.id === model.id && selected.providerID === model.providerID ? "✓ " : "";
       // surface which models are free so an accidental pick cannot bill the account
-      const free = isFreeModel(model as never) ? " · free" : "";
+      const free = isFreeModel(model) ? " · free" : "";
       keyboard.text(buttonLabel(`${marker}${model.name} · ${model.providerID}${free}`), actionData(chatId, {
         kind: "model-variants",
         id: model.id,
@@ -307,8 +308,11 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       keyboard.row();
     }
     keyboard.text("Back", actionData(chatId, { kind: "home" }));
+    const automatic = core.getState(chatId).modelAuto === true;
+    keyboard.row();
+    keyboard.text(automatic ? "✓ Automatic (newest free)" : "Automatic (newest free)", actionData(chatId, { kind: "auto-model" }));
     const text = models.length
-      ? `<b>Choose a model</b> (page ${currentPage + 1}/${pageCount})\nChoose a model to see its available variants.`
+      ? `<b>Choose a model</b> (page ${currentPage + 1}/${pageCount})\nChoose a model to see its available variants. Automatic follows the newest free model that reads text and images.`
       : "No enabled models are available for this project. OpenCode model availability depends on its provider setup.";
     return { text, keyboard };
   }
@@ -424,6 +428,10 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       }
       case "models":
         await editScreen(ctx, await modelScreen(chatId, action.page));
+        return;
+      case "auto-model":
+        core.setAutoModel(chatId);
+        await showHome(ctx, chatId, "Back on automatic: the next session uses the newest free model that reads text and images.");
         return;
       case "model-variants":
         await editScreen(ctx, await modelVariantScreen(chatId, action.id, action.providerID, action.page));

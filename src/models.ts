@@ -8,8 +8,9 @@ type ModelRef = components["schemas"]["Model.Ref"];
  * A model costs nothing to call. OpenCode reports `cost` as a list of price
  * entries; a free model has every entry at zero.
  */
-export function isFreeModel(model: ModelInfo): boolean {
-  const cost = model.cost;
+/** Accepts the loose shape the bot's model list arrives in. */
+export function isFreeModel(model: ModelInfo | { cost?: unknown }): boolean {
+  const cost = (model as ModelInfo).cost;
   if (!cost || cost.length === 0) return false;
   return cost.every((entry) =>
     (entry.input ?? 0) === 0 && (entry.output ?? 0) === 0 &&
