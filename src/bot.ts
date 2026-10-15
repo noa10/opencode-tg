@@ -156,30 +156,106 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     });
   }
 
-  const progressMsg = new Map<number, { messageId: number; lastEdit: number }>();
-  function throttleProgress(chatId: number, text: string) {
+  const PROGRESS_THROTTLE_MS = 1200;
+
+  type ProgressBubble = {
+    /** Message id backing the bubble; set when the create resolves (stays unset if it failed). */
+    messageId?: number;
+    /** Resolves when the create call settles, so later edits serialize behind it. */
+    created: Promise<void>;
+    /** Content currently on the wire (or being applied). */
+    content: string;
+    /** When the last dispatch was *issued* — set synchronously to close the burst race. */
+    lastDispatch: number;
+    /** Serializes edits so Telegram cannot apply them out of order. */
+    chain: Promise<unknown>;
+    /** Newest text received inside the throttle window, flushed on a timer. */
+    pendingText?: string;
+    flushTimer?: NodeJS.Timeout;
+  };
+  const progressBubbles = new Map<number, ProgressBubble>();
+
+  function clearProgress(chatId: number): void {
+    const bubble = progressBubbles.get(chatId);
+    if (!bubble) return;
+    if (bubble.flushTimer) clearTimeout(bubble.flushTimer);
+    progressBubbles.delete(chatId);
+    // Remove the bubble so turns do not leave a stale "🔄 …" line behind. Wait for
+    // in-flight edits first, and for the create so a slow send is not orphaned.
+    void bubble.chain.then(() => {
+      const messageId = bubble.messageId;
+      if (messageId === undefined) return;
+      void bot.api.deleteMessage(chatId, messageId).catch((error: unknown) => {
+        console.error("progress cleanup failed", error);
+      });
+    });
+  }
+
+  function flushProgress(chatId: number): void {
+    const bubble = progressBubbles.get(chatId);
+    if (!bubble) return;
+    if (bubble.flushTimer) {
+      clearTimeout(bubble.flushTimer);
+      bubble.flushTimer = undefined;
+    }
+    const next = bubble.pendingText;
+    bubble.pendingText = undefined;
+    if (next && next !== bubble.content) dispatchProgress(chatId, bubble, next);
+  }
+
+  function dispatchProgress(chatId: number, bubble: ProgressBubble, content: string): void {
+    bubble.lastDispatch = Date.now();
+    bubble.content = content;
+    bubble.chain = bubble.chain.then(async () => {
+      // read the id at execution time: the create may still be in flight when a
+      // flush is queued, and the continuation only runs once it has settled
+      const messageId = bubble.messageId;
+      if (messageId === undefined) return; // the create failed; there is no bubble to edit
+      try {
+        await bot.api.editMessageText(chatId, messageId, content, { parse_mode: "HTML" });
+      } catch (error) {
+        // editing to identical text is not an error for our throttle
+        if (error instanceof GrammyError && error.error_code === 400 && error.description.includes("message is not modified")) return;
+        console.error("progress edit failed", error);
+      }
+    });
+  }
+
+  function throttleProgress(chatId: number, text: string): void {
+    const content = `🔄 ${escapeHtml(redact(text))}`;
     const now = Date.now();
-    const prev = progressMsg.get(chatId);
-    if (prev && now - prev.lastEdit < 1200) return;
-    const content = `🔄 ${escapeHtml(text)}`;
-    if (prev) {
-      void bot.api
-        .editMessageText(chatId, prev.messageId, content, { parse_mode: "HTML" })
-        .then(() => progressMsg.set(chatId, { messageId: prev.messageId, lastEdit: now }))
-        .catch((error: unknown) => {
-          // editing to identical text is not an error for our throttle
-          if (error instanceof GrammyError && error.error_code === 400 && error.description.includes("message is not modified")) {
-            progressMsg.set(chatId, { messageId: prev.messageId, lastEdit: now });
-            return;
-          }
-          console.error("progress edit failed", error);
-        });
-    } else {
+    const prev = progressBubbles.get(chatId);
+    if (!prev) {
+      // Create the map entry synchronously so a burst of events cannot double-send;
+      // the messageId promise closes the dispatch-to-response window.
+      let resolveCreated!: () => void;
+      const created = new Promise<void>((resolve) => { resolveCreated = resolve; });
+      const bubble: ProgressBubble = { created, content, lastDispatch: now, chain: created };
+      progressBubbles.set(chatId, bubble);
       void bot.api
         .sendMessage(chatId, content, { parse_mode: "HTML" })
-        .then((message) => progressMsg.set(chatId, { messageId: message.message_id, lastEdit: now }))
-        .catch((error: unknown) => console.error("progress message failed", error));
+        .then((message) => { bubble.messageId = message.message_id; })
+        .catch((error: unknown) => {
+          console.error("progress message failed", error);
+          // Drop the dead entry so the next event can open a fresh bubble; keeping it
+          // would swallow every later progress line for the rest of the turn.
+          if (bubble.flushTimer) clearTimeout(bubble.flushTimer);
+          if (progressBubbles.get(chatId) === bubble) progressBubbles.delete(chatId);
+        })
+        .finally(() => resolveCreated());
+      return;
     }
+    prev.pendingText = content; // never lose the newest state, even mid-burst
+    const since = now - prev.lastDispatch;
+    if (since < PROGRESS_THROTTLE_MS) {
+      if (!prev.flushTimer) {
+        const timer = setTimeout(() => flushProgress(chatId), PROGRESS_THROTTLE_MS - since + 5);
+        timer.unref?.();
+        prev.flushTimer = timer;
+      }
+      return;
+    }
+    flushProgress(chatId);
   }
 
   core.setHandlers({
@@ -220,6 +296,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     },
     onProgress: throttleProgress,
     onDone: async (chatId, text) => {
+      // clear before sending: the answer send can be slow, and a queued turn that
+      // starts meanwhile must open its own bubble, not inherit and lose this one
+      clearProgress(chatId);
       const html = toTelegramHtml(redact(text));
       for (const part of chunk(html)) {
         try {
@@ -231,13 +310,18 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
           });
         }
       }
-      progressMsg.delete(chatId);
+    },
+    onInterrupted: (chatId) => {
+      clearProgress(chatId);
+      void bot.api.sendMessage(chatId, "⏹ Interrupted.").catch((error: unknown) => {
+        console.error("interrupt notice failed", error);
+      });
     },
     onError: async (chatId, text) => {
       await bot.api.sendMessage(chatId, `⚠️ ${escapeHtml(redact(text))}`, { parse_mode: "HTML" }).catch((error: unknown) => {
         console.error("error notice failed", error);
       });
-      progressMsg.delete(chatId);
+      clearProgress(chatId);
     },
   });
 

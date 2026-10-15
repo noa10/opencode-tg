@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { redact } from "./format";
 
 function resolvePath(value: string): string {
   return resolve(value);
@@ -63,15 +64,36 @@ export interface CoreHandlers {
   onProgress: (chatId: number, text: string) => void;
   onDone: (chatId: number, text: string) => void;
   onError: (chatId: number, text: string) => void;
+  /** A turn ended because it was interrupted/cancelled — informational, not an error. */
+  onInterrupted?: (chatId: number) => void;
 }
+
+/** How a watched execution ended. "timeout" is the bridge's own watchdog. */
+export type ExecutionOutcome = "succeeded" | "failed" | "interrupted" | "timeout";
+
+/** Argument keys whose values are secrets even when the value itself looks plain. */
+const SENSITIVE_ARG_KEY = /(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|authorization)/i;
 
 export class Core {
   sessionChat = new Map<string, number>();
   private busyChats = new Set<number>();
   private queues = new Map<number, QueueEntry[]>(); // chatId -> queued prompts/attachments
-  private pendingExecution = new Map<string, { resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>();
+  private pendingExecution = new Map<string, { resolve: (outcome: ExecutionOutcome) => void; timer: NodeJS.Timeout }>();
   private validatedSessions = new Set<string>();
   private sessionInitializations = new Map<number, Map<string, Promise<string>>>();
+  // sessionID -> tool call id -> tool name (learned from input.started, used by later events)
+  private toolNamesBySession = new Map<string, Map<string, string>>();
+  // sessionID -> most recent *reliably named* tool. Covers lifecycle events whose call id was
+  // never mapped (out-of-order delivery). In-memory only: a bridge restart empties it, and such
+  // events then degrade to the generic "tool" — this does NOT survive a restart.
+  private lastToolBySession = new Map<string, string>();
+  // sessionID -> tool call id -> redacted argument summary (learned from input.ended/called)
+  private toolInputsBySession = new Map<string, Map<string, string>>();
+  // Tracks unknown session.tool.* event types we have already reported, so schema
+  // drift surfaces once rather than flooding the log on every turn.
+  private seenUnknownToolEventTypes = new Set<string>();
+  // One-time signal that a tool event could not be named at all (field drift).
+  private warnedUnnamedTool = false;
 
   constructor(
     private client: Client,
@@ -109,24 +131,98 @@ export class Core {
   private route(e: OcEvent) {
     const sid: string | undefined = e.data?.sessionID;
     switch (e.type) {
+      case "session.execution.started":
+        this.notifyProgress(sid, "working…");
+        break;
       case "session.execution.succeeded":
-        this.finishExecution(sid, true);
+        this.finishExecution(sid, "succeeded");
         break;
       case "session.execution.failed":
-        this.finishExecution(sid, false);
+        this.finishExecution(sid, "failed");
+        break;
+      case "session.execution.interrupted":
+        // a user interrupt or a cancelled question form genuinely ends the wait; without
+        // this the bridge would sit on a 10-minute timeout and report a failure
+        this.finishExecution(sid, "interrupted");
+        break;
+      case "session.text.started":
+        this.notifyProgress(sid, "writing response…");
         break;
       case "session.text.ended":
         if (sid && e.data?.text) this.lastText.set(sid, e.data.text);
         break;
-      case "session.step.started":
+      case "session.step.started": {
+        const agent = typeof e.data?.agent === "string" ? e.data.agent : undefined;
+        const model = typeof e.data?.model?.id === "string" ? e.data.model.id : undefined;
+        this.notifyProgress(sid, agent || model ? `thinking… (${[agent, model].filter(Boolean).join(" / ")})` : "thinking…");
+        break;
+      }
+      // Verified against OpenCode 2.0.29 SSE payloads: `input.started` carries
+      // {id, name}; the later tool events carry only {id} (plus assistantMessageID,
+      // input/text/content). `input.ended.text` is a JSON string of the arguments
+      // but is commonly empty, so the arguments come from `called.input`.
+      case "session.tool.input.started":
+        if (sid) {
+          // Route through the shared resolver so a missing/renamed name field hits the
+          // drift warning, and only persist names that came from the event (or an
+          // already-mapped id) — the "tool" default must not poison the per-id or
+          // last-seen maps that later unnamed events depend on.
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          this.notifyProgress(sid, `preparing tool: ${name}`);
+        }
+        break;
+      case "session.tool.input.ended":
+        if (sid) {
+          const id = e.data?.id != null ? String(e.data.id) : undefined;
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          const summary = this.describeToolInput(e.data?.text);
+          if (id && summary) this.rememberToolInput(sid, id, summary);
+          this.notifyProgress(sid, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
+        }
+        break;
       case "session.tool.called":
         if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) {
-            const label =
-              e.type === "session.tool.called" && e.data?.tool ? `tool: ${e.data.tool}` : "working…";
-            this.handlers.onProgress(chatId, label);
-          }
+          const id = e.data?.id != null ? String(e.data.id) : undefined;
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          const summary = this.describeToolInput(e.data?.input) || (id ? this.toolInputFor(sid, id) : undefined) || "";
+          if (id && summary) this.rememberToolInput(sid, id, summary);
+          this.notifyProgress(sid, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
+        }
+        break;
+      case "session.tool.progress":
+        if (sid) {
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          this.notifyProgress(sid, `running tool: ${name}…`);
+        }
+        break;
+      case "session.tool.success":
+        if (sid) {
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          this.notifyProgress(sid, `completed tool: ${name}`);
+        }
+        break;
+      case "session.tool.failed":
+      case "session.tool.error":
+        if (sid) {
+          // deliberately not rememberKnownToolName: a failed call must not seed a
+          // name that later events for the same id would then inherit
+          const name = this.resolveToolName(sid, e.data);
+          const error = e.data?.error;
+          const reason = typeof error?.message === "string"
+            ? error.message
+            : typeof error === "string"
+              ? error
+              : typeof e.data?.message === "string"
+                ? e.data.message
+                : error != null
+                  ? JSON.stringify(error)
+                  : undefined;
+          this.notifyProgress(sid, reason ? `tool failed: ${name} — ${this.truncate(redact(reason))}` : `tool failed: ${name}`);
         }
         break;
       case "permission.asked":
@@ -144,8 +240,185 @@ export class Core {
       default:
         if (e.type.startsWith("permission.") && e.type !== "permission.asked") {
           console.log(`[ignored permission event family] ${e.type}`);
+        } else if (e.type.startsWith("session.tool.") && !this.seenUnknownToolEventTypes.has(e.type)) {
+          this.seenUnknownToolEventTypes.add(e.type);
+          console.log(`[unknown tool event] ${e.type}`);
         }
+        break;
     }
+  }
+
+  /**
+   * Progress is only useful (and safe to display) while this bridge is waiting on
+   * the execution. A turn started from the OpenCode web UI/TUI would otherwise open
+   * a progress bubble that no terminal handler ever clears.
+   */
+  private notifyProgress(sid: string | undefined, text: string): void {
+    if (!sid || !this.pendingExecution.has(sid)) return;
+    const chatId = this.sessionChat.get(sid);
+    if (chatId != null) this.handlers.onProgress(chatId, text);
+  }
+
+  private rememberToolName(sessionID: string, toolCallID: string, name: string): void {
+    let names = this.toolNamesBySession.get(sessionID);
+    if (!names) {
+      names = new Map();
+      this.toolNamesBySession.set(sessionID, names);
+    }
+    names.set(toolCallID, name);
+    this.lastToolBySession.set(sessionID, name);
+  }
+
+  private toolNameFor(sessionID: string, toolCallID?: string): string | undefined {
+    if (!toolCallID) return undefined;
+    return this.toolNamesBySession.get(sessionID)?.get(toolCallID);
+  }
+
+  /** Name for a lifecycle event: per-call id first, then event fields, then last seen. */
+  private resolveToolName(sessionID: string, data: any): string {
+    const id = data?.id != null ? String(data.id) : undefined;
+    const named = this.toolNameFor(sessionID, id)
+      ?? (typeof data?.name === "string" ? data.name : undefined)
+      ?? (typeof data?.tool === "string" ? data.tool : undefined)
+      ?? this.lastToolBySession.get(sessionID);
+    if (named) return named;
+    if (!this.warnedUnnamedTool) {
+      this.warnedUnnamedTool = true;
+      console.warn(
+        `[tool event] no tool name for id=${id ?? "none"} in session ${sessionID}; using the generic "tool" — the event schema may have drifted`,
+      );
+    }
+    return "tool";
+  }
+
+  /**
+   * Persist a tool name only when its source is certain: the event carried it, or the
+   * call id was already mapped. Storing the last-seen/"tool" fallback would shadow a
+   * real name a later event might still deliver and would overwrite the last-seen
+   * fallback that subsequent unknown-id events rely on.
+   */
+  private rememberKnownToolName(sessionID: string, data: any, name: string): void {
+    if (data?.id == null) return;
+    const id = String(data.id);
+    const eventNamed = typeof data?.name === "string" || typeof data?.tool === "string";
+    if (!eventNamed && this.toolNamesBySession.get(sessionID)?.get(id) !== name) return;
+    this.rememberToolName(sessionID, id, name);
+  }
+
+  private rememberToolInput(sessionID: string, toolCallID: string, summary: string): void {
+    let inputs = this.toolInputsBySession.get(sessionID);
+    if (!inputs) {
+      inputs = new Map();
+      this.toolInputsBySession.set(sessionID, inputs);
+    }
+    inputs.set(toolCallID, summary);
+  }
+
+  private toolInputFor(sessionID: string, toolCallID?: string): string | undefined {
+    if (!toolCallID) return undefined;
+    return this.toolInputsBySession.get(sessionID)?.get(toolCallID);
+  }
+
+  /**
+   * Turn a tool's arguments into one short, readable line. Tool schemas vary a lot
+   * (`question` nests prompts and options, `edit` uses old/new strings, `shell` uses
+   * command), so prefer known human fields and fall back to compact `key: value`
+   * pairs — never a raw JSON dump, which is what a plain stringify would produce.
+   */
+  private describeToolInput(input: unknown): string {
+    if (input == null) return "";
+    if (typeof input === "string") {
+      const trimmed = input.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        // Some events carry arguments as a JSON string. Parse it so nested shapes
+        // (question/options, edit old/new) render readably; if it is truncated or
+        // otherwise unparseable, show nothing rather than dumping raw JSON.
+        try {
+          return this.describeToolInput(JSON.parse(trimmed));
+        } catch {
+          return "";
+        }
+      }
+      return this.truncate(redact(input));
+    }
+    if (typeof input === "number" || typeof input === "boolean") return String(input);
+    if (Array.isArray(input)) {
+      const first = input[0];
+      if (first === undefined) return "";
+      const head = this.describeToolInput(first);
+      if (!head) return "";
+      // multi-item arguments must not silently lose their extra entries
+      return input.length > 1 ? this.truncate(`${head} (+${input.length - 1} more)`) : head;
+    }
+    if (typeof input !== "object") return this.truncate(redact(String(input)));
+
+    const record = input as Record<string, unknown>;
+
+    // question tool: [{question, header, options:[{label}, ...]}]
+    if (Array.isArray(record.questions)) {
+      const first = record.questions[0];
+      const question = typeof first === "object" && first !== null ? first as Record<string, unknown> : undefined;
+      const header = typeof question?.header === "string" ? question.header : undefined;
+      const prompt = typeof question?.question === "string"
+        ? question.question
+        : typeof question?.prompt === "string"
+          ? question.prompt
+          : undefined;
+      const labels = Array.isArray(question?.options)
+        ? question.options
+            .map((option) => {
+              if (typeof option === "string") return option;
+              if (typeof option === "object" && option !== null) {
+                const optionRecord = option as Record<string, unknown>;
+                if (typeof optionRecord.label === "string") return optionRecord.label;
+                if (typeof optionRecord.value === "string") return optionRecord.value;
+              }
+              return undefined;
+            })
+            .filter((label): label is string => typeof label === "string" && label.trim().length > 0)
+        : [];
+      const count = record.questions.length;
+      const base = prompt && header && !prompt.startsWith(header) ? `${header}: ${prompt}` : prompt ?? header;
+      if (!base && labels.length === 0) return "";
+      const optionText = labels.length
+        ? `${labels.slice(0, 4).join(" / ")}${labels.length > 4 ? ` / … (+${labels.length - 4})` : ""}`
+        : undefined;
+      // redact BEFORE truncating: a secret cut in half can fall under the regex thresholds
+      return this.truncate(redact([
+        base ?? "question",
+        optionText ? `— ${optionText}` : undefined,
+        count > 1 ? `(${count} questions)` : undefined,
+      ].filter(Boolean).join(" ")));
+    }
+
+    // flat tools: pick the first field a human would recognize
+    for (const key of ["command", "cmd", "query", "pattern", "url", "filePath", "file", "path", "prompt", "description", "text", "message", "name"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) return this.truncate(redact(value));
+    }
+
+    // unknown structure: show up to three readable fields instead of JSON.
+    // Secret-looking keys are masked here too (redact()'s patterns cannot see
+    // the key/value split this walk sees).
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(record)) {
+      if (parts.length >= 3) break;
+      if (typeof value === "string" && value.trim()) {
+        parts.push(SENSITIVE_ARG_KEY.test(key) ? `${key}: [redacted]` : `${key}: ${value}`);
+      } else if (typeof value === "number" || typeof value === "boolean") {
+        parts.push(`${key}: ${value}`);
+      }
+    }
+    if (parts.length) return this.truncate(redact(parts.join(", ")));
+
+    // structured values only (e.g. nested edits): show keys, not an opaque blob
+    const keys = Object.keys(record);
+    return keys.length ? this.truncate(redact(`args: ${keys.slice(0, 4).join(", ")}`)) : "";
+  }
+
+  private truncate(value: string, max = 160): string {
+    const trimmed = value.replace(/\s+/g, " ").trim();
+    return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1)}…`;
   }
 
   private async reconcilePermissions() {
@@ -191,14 +464,22 @@ export class Core {
     this.handlers.onPermission(chatId, req);
   }
 
-  private finishExecution(sid: string | undefined, ok: boolean) {
+  private finishExecution(sid: string | undefined, outcome: ExecutionOutcome) {
     if (!sid) return;
+    // per-turn tool tracking is done once the turn is
+    this.clearToolState(sid);
     const p = this.pendingExecution.get(sid);
     if (p) {
       clearTimeout(p.timer);
       this.pendingExecution.delete(sid);
-      p.resolve(ok);
+      p.resolve(outcome);
     }
+  }
+
+  private clearToolState(sessionID: string): void {
+    this.toolNamesBySession.delete(sessionID);
+    this.lastToolBySession.delete(sessionID);
+    this.toolInputsBySession.delete(sessionID);
   }
 
   async ensureSession(chatId: number): Promise<string> {
@@ -251,6 +532,7 @@ export class Core {
 
   async newSession(chatId: number): Promise<string> {
     const st = this.getState(chatId);
+    if (st.sessionID) this.clearToolState(st.sessionID);
     return this.createSession(chatId, st);
   }
 
@@ -418,6 +700,8 @@ export class Core {
     const session = response.data?.data;
     const directory = session?.location?.directory ? resolvePath(session.location.directory) : undefined;
     if (response.error || !session || !directory || !allowedDirectories.includes(directory)) return false;
+    const previousSessionID = this.getState(chatId).sessionID;
+    if (previousSessionID && previousSessionID !== sessionID) this.clearToolState(previousSessionID);
     this.setState(chatId, {
       ...this.getState(chatId),
       sessionID,
@@ -447,7 +731,7 @@ export class Core {
     return !response.error;
   }
 
-  async runCommand(chatId: number, name: string, text: string): Promise<"completed" | "busy" | "failed"> {
+  async runCommand(chatId: number, name: string, text: string): Promise<"completed" | "busy" | "failed" | "interrupted"> {
     let sessionID = await this.ensureSession(chatId);
     if (this.busyChats.has(chatId)) return "busy";
     this.busyChats.add(chatId);
@@ -473,8 +757,12 @@ export class Core {
             this.handlers.onError(chatId, `command failed: ${JSON.stringify(response.error).slice(0, 300)}`);
             return "failed";
           }
-          const retrySucceeded = await retryDone;
-          if (!retrySucceeded) {
+          const retryOutcome = await retryDone;
+          if (retryOutcome === "interrupted") {
+            this.handlers.onInterrupted?.(chatId);
+            return "interrupted";
+          }
+          if (retryOutcome !== "succeeded") {
             const reason = await this.lastAssistantError(sessionID);
             this.handlers.onError(chatId, reason ? `command failed: ${reason}` : "command execution timed out or failed");
             return "failed";
@@ -487,8 +775,12 @@ export class Core {
           this.handlers.onError(chatId, `command failed: ${JSON.stringify(response.error).slice(0, 300)}`);
           return "failed";
         }
-        const succeeded = await done;
-        if (!succeeded) {
+        const outcome = await done;
+        if (outcome === "interrupted") {
+          this.handlers.onInterrupted?.(chatId);
+          return "interrupted";
+        }
+        if (outcome !== "succeeded") {
           const reason = await this.lastAssistantError(sessionID);
           this.handlers.onError(chatId, reason ? `command failed: ${reason}` : "command execution timed out or failed");
           return "failed";
@@ -507,12 +799,12 @@ export class Core {
     }
   }
 
-  private waitForExecution(sessionID: string): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
+  private waitForExecution(sessionID: string): Promise<ExecutionOutcome> {
+    return new Promise<ExecutionOutcome>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingExecution.delete(sessionID);
         void this.interruptSession(sessionID);
-        resolve(false);
+        resolve("timeout");
       }, EXECUTION_TIMEOUT_MS);
       // never keep the process alive just to watch for a slow agent turn
       timer.unref?.();
@@ -539,6 +831,7 @@ export class Core {
   private async dropStaleSession(chatId: number, sessionID: string): Promise<string> {
     this.validatedSessions.delete(sessionID);
     this.sessionChat.delete(sessionID);
+    this.clearToolState(sessionID);
     const st = this.getState(chatId);
     if (st.sessionID === sessionID) this.setState(chatId, { ...st, sessionID: undefined });
     return this.ensureSession(chatId);
@@ -549,7 +842,7 @@ export class Core {
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingExecution.delete(sessionID);
-    pending.resolve(false);
+    pending.resolve("failed");
   }
 
   private drainPromptQueue(chatId: number): void {
@@ -614,8 +907,12 @@ export class Core {
         this.handlers.onError(chatId, `prompt failed: ${JSON.stringify(sent.error).slice(0, 300)}`);
         return;
       }
-      const retryOk = await retryDone;
-      if (!retryOk) {
+      const retryOutcome = await retryDone;
+      if (retryOutcome === "interrupted") {
+        this.handlers.onInterrupted?.(chatId);
+        return;
+      }
+      if (retryOutcome !== "succeeded") {
         await this.reportExecutionFailure(sessionID, chatId);
         return;
       }
@@ -627,8 +924,12 @@ export class Core {
       return;
     }
 
-    const ok = await done;
-    if (!ok) {
+    const outcome = await done;
+    if (outcome === "interrupted") {
+      this.handlers.onInterrupted?.(chatId);
+      return;
+    }
+    if (outcome !== "succeeded") {
       await this.reportExecutionFailure(sessionID, chatId);
       return;
     }
@@ -743,6 +1044,7 @@ export class Core {
   setProject(chatId: number, projectDir: string) {
     const st = this.getState(chatId);
     if (st.projectDir === projectDir) return; // no-op: keep session/agent/model
+    if (st.sessionID) this.clearToolState(st.sessionID);
     this.setState(chatId, { projectDir });
   }
 

@@ -1,17 +1,49 @@
-const SECRET_PATTERNS = [
-  /sk-[A-Za-z0-9_-]{10,}/g,
-  /ghp_[A-Za-z0-9]{20,}/g,
-  /github_pat_[A-Za-z0-9_]{20,}/g,
-  /xox[baprs]-[A-Za-z0-9-]{10,}/g,
-  /AIza[0-9A-Za-z_-]{20,}/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /[A-Za-z0-9+/]{40,}={0,2}/g, // generic long base64-ish blobs, last-resort, noisy — used sparingly below
+type SecretPattern = { re: RegExp; replacement?: string };
+
+/**
+ * Ordered specific-first; the generic base64 catch-all stays last because
+ * `redact()` deliberately skips it. Patterns that should keep their surroundings
+ * (key names, URL shape) capture them and use `$1[redacted]`.
+ */
+const SECRET_PATTERNS: SecretPattern[] = [
+  { re: /sk-[A-Za-z0-9_-]{10,}/g },
+  { re: /ghp_[A-Za-z0-9]{20,}/g },
+  { re: /github_pat_[A-Za-z0-9_]{20,}/g },
+  { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g },
+  { re: /AIza[0-9A-Za-z_-]{20,}/g },
+  { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g },
+  // Telegram bot tokens ("<bot id>:<url-safe secret>") — this bridge holds one
+  { re: /\b[0-9]{6,12}:[A-Za-z0-9_-]{30,}\b/g },
+  // Bearer/Authorization header values and JWTs
+  { re: /(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1[redacted]" },
+  // Basic auth header value (base64 "user:password")
+  { re: /(\bBasic\s+)[A-Za-z0-9+/=]{8,}/gi, replacement: "$1[redacted]" },
+  { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g },
+  // AWS access keys
+  { re: /\bA[SK]IA[0-9A-Z]{16}\b/g },
+  // credentials in a connection URL's userinfo ("postgres://user:pass@host")
+  { re: /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s/]+@/g, replacement: "$1[redacted]@" },
+  // Slack incoming webhooks
+  { re: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_/-]+/g, replacement: "https://hooks.slack.com/services/[redacted]" },
+  // secrets in URL query strings — keep the parameter name and the rest of the URL
+  { re: /([?&](?:token|api[_-]?key|apikey|access[_-]?(?:key|token)|sig(?:nature)?|secret|password|credential|client[_-]?secret)=)[^&\s'"]+/gi, replacement: "$1[redacted]" },
+  // KEY=value-style assignments in tool commands — keep the key, mask the value.
+  // The lookahead avoids a second pass over already-redacted values and leaves
+  // "Authorization: Bearer/Basic …" to the header patterns above (which mask the token).
+  { re: /(["']?\b[A-Za-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|authorization)[A-Za-z0-9_]*["']?\s*[=:]\s*["']?)(?!\[redacted\]|(?:Bearer|Basic)\b)[^\s"',;&}]{4,}/gi, replacement: "$1[redacted]" },
+  // --password-style flags, including suffixed names like --db-password. The keyword
+  // must end the flag name so lookalikes like --tokenizer/--secret-scanner stay intact.
+  { re: /(--[A-Za-z0-9-]*(?:password|passwd|token|secret|api[-_]?key|apikey|credential)\b\s+)(\S+)/gi, replacement: "$1[redacted]" },
+  // HTTP basic-auth flags: curl -u user:pass / --user user:pass
+  { re: /((?:-u|--user)\s+[^\s:@]+:)(\S{4,})/gi, replacement: "$1[redacted]" },
+  { re: /[A-Za-z0-9+/]{40,}={0,2}/g }, // generic long base64-ish blobs, last-resort, noisy — used sparingly below
 ];
 
 export function redact(text: string): string {
   let out = text;
   for (let i = 0; i < SECRET_PATTERNS.length - 1; i++) {
-    out = out.replace(SECRET_PATTERNS[i], "[redacted]");
+    const pattern = SECRET_PATTERNS[i];
+    out = out.replace(pattern.re, pattern.replacement ?? "[redacted]");
   }
   return out;
 }

@@ -128,3 +128,62 @@ test("an unknown slash command is not forwarded to the agent", async () => {
   assert.match(String(replies.at(-1)?.payload.text), /Unknown command/);
   assert.deepEqual(prompted, [], "the misspelled command must not become a prompt");
 });
+
+test("a burst of progress events creates one bubble and flushes the newest line", async () => {
+  const harness = await createHarness();
+  const progressSends = () =>
+    harness.calls.filter((call) => call.method === "sendMessage" && String(call.payload.text).startsWith("🔄")).length;
+  harness.handlers()?.onProgress(71, "step one");
+  harness.handlers()?.onProgress(71, "step two");
+  assert.equal(progressSends(), 1, "a burst must not create duplicate progress bubbles");
+  await new Promise((resolve) => setTimeout(resolve, 1400));
+  const edits = harness.calls.filter((call) => call.method === "editMessageText");
+  assert.equal(edits.length, 1, "the text dropped by the throttle must be flushed after the window");
+  assert.match(String(edits[0]?.payload.text), /step two/, "the flushed edit must carry the newest state");
+});
+
+test("a failed progress message does not swallow the rest of the turn", async () => {
+  const harness = await createHarness({ failProgressSendOnce: true });
+  const bubbleSends = () =>
+    harness.calls.filter((call) => call.method === "sendMessage" && String(call.payload.text).startsWith("🔄")).length;
+  harness.handlers()?.onProgress(71, "first");
+  await new Promise((resolve) => setTimeout(resolve, 50)); // let the failed create settle
+  harness.handlers()?.onProgress(71, "second");
+  assert.equal(bubbleSends(), 2, "a fresh bubble must be opened after the create failure");
+});
+
+test("a flush arriving before the progress message id is applied once it resolves", async () => {
+  const harness = await createHarness({ progressSendDelayMs: 1500 });
+  harness.handlers()?.onProgress(71, "first");
+  harness.handlers()?.onProgress(71, "second");
+  await new Promise((resolve) => setTimeout(resolve, 1700)); // slow create + throttled flush
+  const edits = harness.calls.filter((call) => call.method === "editMessageText");
+  assert.equal(edits.length, 1, "the newest state must not be dropped while the create is slow");
+  assert.match(String(edits[0]?.payload.text), /second/, "the queued flush must carry the newest state");
+});
+
+test("finishing a turn removes the progress bubble from Telegram", async () => {
+  const harness = await createHarness();
+  harness.handlers()?.onProgress(71, "working");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  harness.handlers()?.onDone(71, "answer");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const deletions = harness.calls.filter((call) => call.method === "deleteMessage");
+  assert.equal(deletions.length, 1, "the stale progress bubble must be deleted");
+  assert.equal(typeof deletions[0]?.payload.message_id, "number");
+});
+
+test("a queued turn's progress is not deleted by the previous turn's cleanup", async () => {
+  const harness = await createHarness();
+  const bubbleSends = () =>
+    harness.calls.filter((call) => call.method === "sendMessage" && String(call.payload.text).startsWith("🔄")).length;
+  harness.handlers()?.onProgress(71, "turn one");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  harness.handlers()?.onDone(71, "answer");
+  // onDone yields on the answer send; a queued turn opens its progress here
+  harness.handlers()?.onProgress(71, "turn two");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(bubbleSends(), 2, "the queued turn must open its own bubble");
+  const deletions = harness.calls.filter((call) => call.method === "deleteMessage");
+  assert.equal(deletions.length, 1, "only the finished turn's bubble is deleted");
+});
