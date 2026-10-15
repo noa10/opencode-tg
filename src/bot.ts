@@ -161,7 +161,7 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     const now = Date.now();
     const prev = progressMsg.get(chatId);
     if (prev && now - prev.lastEdit < 1200) return;
-    const content = `🔄 ${escapeHtml(text)}`;
+    const content = `🔄 ${escapeHtml(redact(text))}`;
     if (prev) {
       void bot.api
         .editMessageText(chatId, prev.messageId, content, { parse_mode: "HTML" })

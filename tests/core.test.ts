@@ -197,3 +197,74 @@ test("getPendingPermissions reports API failure instead of hiding it", async () 
   }, { projectDir: "/repo" });
   await assert.rejects(core.getPendingPermissions(), /pending permission list failed/);
 });
+
+test("a question tool's progress line shows the prompt and options, not raw JSON", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const handlers: CoreHandlers = {
+    onPermission: () => {},
+    onProgress: (_chatId, text) => progress.push(text),
+    onDone: () => {},
+    onError: () => {},
+  };
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    handlers,
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  const args = JSON.stringify({
+    questions: [{
+      question: "I can't find the opencode-tg repo locally. How would you like to proceed?",
+      header: "Repo location",
+      options: [{ label: "Clone it", description: "clone from GitHub" }, { label: "Skip it" }],
+    }],
+  });
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "question" } } as OcEvent);
+  onEvent?.({ type: "session.tool.input.ended", data: { sessionID: "session-1", id: "call_1", text: args } } as OcEvent);
+  onEvent?.({ type: "session.tool.called", data: { sessionID: "session-1", id: "call_1", input: JSON.parse(args) } } as OcEvent);
+  const line = progress.at(-1) ?? "";
+  assert.match(line, /Repo location:/);
+  assert.match(line, /How would you like to proceed\?/);
+  assert.match(line, /Clone it/);
+  assert.doesNotMatch(line, /\{"questions"/);
+});
+
+test("truncated arguments fall back to the tool name instead of dumping raw JSON", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "question" } } as OcEvent);
+  onEvent?.({ type: "session.tool.input.ended", data: { sessionID: "session-1", id: "call_1", text: "{\"questions\":[{\"question\":\"trunca" } } as OcEvent);
+  assert.equal(progress.at(-1), "tool: question");
+  assert.doesNotMatch(progress.at(-1) ?? "", /questions/);
+});
+
+test("a tool failure without its call metadata still names the last tool", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_9", name: "question" } } as OcEvent);
+  // the failure arrives after a bridge restart, so the per-call id is unknown
+  onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", error: { message: "Tool execution interrupted" } } } as OcEvent);
+  assert.equal(progress.at(-1), "tool failed: question — Tool execution interrupted");
+});
