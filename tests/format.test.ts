@@ -24,6 +24,24 @@ test("redact masks secret values in URL query strings while keeping the URL shap
   assert.match(out, /&limit=10/);
 });
 
+test("redact masks credentials in connection URLs, basic auth, suffixed flags and Slack webhooks", () => {
+  for (const secret of [
+    "psql --db-password hunter2 -h localhost", // suffixed flag name
+    "DATABASE_URL=postgres://appuser:s3cr3t@db.internal:5432/prod", // URL userinfo
+    "curl -u admin:hunter2 http://internal", // basic auth flag
+    // assembled at runtime so the fixture itself never looks like a live webhook token
+    ["https://hooks.slack.com/services", "T00000000", "B00000000", "XXXXXXXXXXXXXXXXXXXXXXXX"].join("/"),
+  ]) {
+    assert.match(redact(secret), /\[redacted\]/, `should mask ${secret}`);
+  }
+});
+
+test("redact does not double-mask a Bearer header and is stable under a second pass", () => {
+  const header = "Authorization: Bearer supersecrettoken123";
+  assert.equal(redact(header), "Authorization: Bearer [redacted]");
+  assert.equal(redact(redact(header)), redact(header), "a second redact pass must not change the output");
+});
+
 test("redact leaves benign text untouched", () => {
   assert.equal(redact("no secrets here, just a normal command"), "no secrets here, just a normal command");
 });

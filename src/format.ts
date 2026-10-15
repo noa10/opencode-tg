@@ -19,12 +19,20 @@ const SECRET_PATTERNS: SecretPattern[] = [
   { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g },
   // AWS access keys
   { re: /\bA[SK]IA[0-9A-Z]{16}\b/g },
+  // credentials in a connection URL's userinfo ("postgres://user:pass@host")
+  { re: /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s/]+@/g, replacement: "$1[redacted]@" },
+  // Slack incoming webhooks
+  { re: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_/-]+/g, replacement: "https://hooks.slack.com/services/[redacted]" },
   // secrets in URL query strings — keep the parameter name and the rest of the URL
   { re: /([?&](?:token|api[_-]?key|apikey|access[_-]?(?:key|token)|sig(?:nature)?|secret|password|credential|client[_-]?secret)=)[^&\s'"]+/gi, replacement: "$1[redacted]" },
-  // KEY=value-style assignments in tool commands — keep the key, mask the value
-  { re: /(["']?\b[A-Za-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|authorization)[A-Za-z0-9_]*["']?\s*[=:]\s*["']?)[^\s"',;&}]{4,}/gi, replacement: "$1[redacted]" },
-  // --password-style flags
-  { re: /(--(?:password|passwd|token|secret|api-key|apikey|access-token)\s+)(\S+)/gi, replacement: "$1[redacted]" },
+  // KEY=value-style assignments in tool commands — keep the key, mask the value.
+  // The lookahead avoids a second pass over already-redacted values and leaves
+  // "Authorization: Bearer …" to the bearer pattern above (which masks the token).
+  { re: /(["']?\b[A-Za-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|authorization)[A-Za-z0-9_]*["']?\s*[=:]\s*["']?)(?!\[redacted\]|(?:Bearer|Basic)\b)[^\s"',;&}]{4,}/gi, replacement: "$1[redacted]" },
+  // --password-style flags, including suffixed names like --db-password
+  { re: /(--[A-Za-z0-9-]*(?:password|passwd|token|secret|api[-_]?key|apikey|credential)[A-Za-z0-9-]*\s+)(\S+)/gi, replacement: "$1[redacted]" },
+  // HTTP basic-auth flags: curl -u user:pass / --user user:pass
+  { re: /((?:-u|--user)\s+[^\s:@]+:)(\S{4,})/gi, replacement: "$1[redacted]" },
   { re: /[A-Za-z0-9+/]{40,}={0,2}/g }, // generic long base64-ish blobs, last-resort, noisy — used sparingly below
 ];
 

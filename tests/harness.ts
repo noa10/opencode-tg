@@ -15,6 +15,10 @@ export type HarnessOptions = {
   readonly sendPrompt?: (chatId: number, text: string) => Promise<string | null>;
   readonly pendingCommandTtlMs?: number;
   readonly attachFile?: Core["attachFile"];
+  /** Fail the first "🔄 …" sendMessage so the retry path can be exercised. */
+  readonly failProgressSendOnce?: boolean;
+  /** Delay the first progress sendMessage to open the dispatch-before-id window. */
+  readonly progressSendDelayMs?: number;
 };
 
 export const USER_ID = 71;
@@ -66,11 +70,19 @@ export function updateCallback(data: string, updateID: number, chatID = USER_ID,
 export async function createHarness(options: HarnessOptions = {}) {
   const calls: TelegramCall[] = [];
   let handlers: CoreHandlers | undefined;
+  let progressSendFailures = 0;
   const telegramFetch: typeof fetch = async (input, init) => {
     const requestUrl = input instanceof Request ? input.url : String(input);
     const method = new URL(requestUrl).pathname.split("/").at(-1) ?? "";
     const payload = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
     calls.push({ method, payload });
+    const isProgressSend = method === "sendMessage" && String(payload.text).startsWith("🔄");
+    if (isProgressSend && options.progressSendDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, options.progressSendDelayMs));
+    }
+    if (isProgressSend && options.failProgressSendOnce && progressSendFailures++ === 0) {
+      return Response.json({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" });
+    }
     if (typeof input === "string" && input.includes("/file/bot")) {
       return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
     }

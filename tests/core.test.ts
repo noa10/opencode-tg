@@ -6,6 +6,15 @@ import type { EventBus, OcEvent } from "../src/events";
 import type { ChatState } from "../src/state";
 import { createCore, USER_ID } from "./harness";
 
+/**
+ * Progress is emitted only while the bridge is waiting on a turn. Tests that drive
+ * tool events directly must mark the session watched the same way `sendPrompt` does.
+ */
+function watchSession(core: Core, sessionID: string): void {
+  const internals = core as unknown as { waitForExecution(sessionID: string): Promise<unknown> };
+  void internals.waitForExecution(sessionID);
+}
+
 test("project agent lookup reports API failure instead of an empty agent list", async () => {
   const { core } = createCore({
     GET: async () => ({ data: undefined, error: { message: "Unauthorized" } }),
@@ -216,6 +225,7 @@ test("a question tool's progress line shows the prompt and options, not raw JSON
   );
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
   const args = JSON.stringify({
     questions: [{
       question: "I can't find the opencode-tg repo locally. How would you like to proceed?",
@@ -245,6 +255,7 @@ test("truncated arguments fall back to the tool name instead of dumping raw JSON
   );
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
   onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "question" } } as OcEvent);
   onEvent?.({ type: "session.tool.input.ended", data: { sessionID: "session-1", id: "call_1", text: "{\"questions\":[{\"question\":\"trunca" } } as OcEvent);
   assert.equal(progress.at(-1), "tool: question");
@@ -263,6 +274,7 @@ test("a tool failure with an unmapped call id still names the last known tool", 
   );
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
   onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_9", name: "question" } } as OcEvent);
   // the failure arrives with an id the bridge never mapped (e.g. events buffered out of
   // order), so the per-call lookup misses and the last reliably-named tool is used
@@ -282,6 +294,7 @@ test("a guess from the last-seen fallback is never persisted as a tool name", ()
   );
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
   onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
   // an unmapped call id resolves via the last-seen name but must NOT be stored under it —
   // otherwise a real name arriving later for that id could not take over cleanly
@@ -303,6 +316,7 @@ test("progress lines redact secrets in tool arguments", () => {
   );
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
   const command = 'curl -H "Authorization: Bearer supersecrettoken123" https://example.com/upload';
   onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
   onEvent?.({ type: "session.tool.input.ended", data: { sessionID: "session-1", id: "call_1", text: JSON.stringify({ command }) } } as OcEvent);
@@ -310,6 +324,75 @@ test("progress lines redact secrets in tool arguments", () => {
   const line = progress.at(-1) ?? "";
   assert.match(line, /\[redacted\]/);
   assert.doesNotMatch(line, /supersecrettoken123/);
+});
+
+test("tool failure reasons are collapsed, truncated and fall back to JSON", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
+  onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", id: "call_1", error: { message: "line one\nline two\n\tindented" } } } as OcEvent);
+  assert.equal(progress.at(-1), "tool failed: shell — line one line two indented");
+  // an error object without a message still gets reported (JSON fallback), not dropped
+  onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", id: "call_1", error: { code: 500 } } } as OcEvent);
+  assert.equal(progress.at(-1), 'tool failed: shell — {"code":500}');
+});
+
+test("an unnamed tool event warns once about schema drift", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: Parameters<typeof console.warn>) => warnings.push(values.map(String).join(" "));
+  try {
+    const core = new Core(
+      {} as unknown as Client,
+      { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+      () => ({ sessionID: "session-1", projectDir: "/repo" }),
+      () => {},
+      { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+    );
+    core.attach();
+    core.sessionChat.set("session-1", USER_ID);
+    watchSession(core, "session-1");
+    onEvent?.({ type: "session.tool.success", data: { sessionID: "session-1" } } as OcEvent);
+    onEvent?.({ type: "session.tool.success", data: { sessionID: "session-1" } } as OcEvent);
+    assert.deepEqual(progress, ["completed tool: tool", "completed tool: tool"]);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.filter((warning) => warning.includes("no tool name")).length, 1, "the drift warning must not repeat");
+});
+
+test("progress is not emitted for an execution the bridge is not watching", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  // a turn started from the OpenCode web UI/TUI: mapped session, but no pendingExecution,
+  // so a progress bubble would never get its terminal cleanup
+  onEvent?.({ type: "session.execution.started", data: { sessionID: "session-1" } } as OcEvent);
+  onEvent?.({ type: "session.step.started", data: { sessionID: "session-1", agent: "build" } } as OcEvent);
+  onEvent?.({ type: "session.text.started", data: { sessionID: "session-1" } } as OcEvent);
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
+  onEvent?.({ type: "session.tool.called", data: { sessionID: "session-1", id: "call_1", input: { command: "ls" } } } as OcEvent);
+  assert.deepEqual(progress, []);
 });
 
 test("an interrupted turn ends with a plain interruption notice instead of an error", async () => {

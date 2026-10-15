@@ -92,6 +92,8 @@ export class Core {
   // Tracks unknown session.tool.* event types we have already reported, so schema
   // drift surfaces once rather than flooding the log on every turn.
   private seenUnknownToolEventTypes = new Set<string>();
+  // One-time signal that a tool event could not be named at all (field drift).
+  private warnedUnnamedTool = false;
 
   constructor(
     private client: Client,
@@ -130,10 +132,7 @@ export class Core {
     const sid: string | undefined = e.data?.sessionID;
     switch (e.type) {
       case "session.execution.started":
-        if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) this.handlers.onProgress(chatId, "working…");
-        }
+        this.notifyProgress(sid, "working…");
         break;
       case "session.execution.succeeded":
         this.finishExecution(sid, "succeeded");
@@ -147,33 +146,26 @@ export class Core {
         this.finishExecution(sid, "interrupted");
         break;
       case "session.text.started":
-        if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) this.handlers.onProgress(chatId, "writing response…");
-        }
+        this.notifyProgress(sid, "writing response…");
         break;
       case "session.text.ended":
         if (sid && e.data?.text) this.lastText.set(sid, e.data.text);
         break;
-      case "session.step.started":
-        if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) {
-            const agent = typeof e.data?.agent === "string" ? e.data.agent : undefined;
-            const model = typeof e.data?.model?.id === "string" ? e.data.model.id : undefined;
-            this.handlers.onProgress(chatId, agent || model ? `thinking… (${[agent, model].filter(Boolean).join(" / ")})` : "thinking…");
-          }
-        }
+      case "session.step.started": {
+        const agent = typeof e.data?.agent === "string" ? e.data.agent : undefined;
+        const model = typeof e.data?.model?.id === "string" ? e.data.model.id : undefined;
+        this.notifyProgress(sid, agent || model ? `thinking… (${[agent, model].filter(Boolean).join(" / ")})` : "thinking…");
         break;
-      // Verified against OpenCode 2.0.28 SSE payloads: `input.started` carries
+      }
+      // Verified against OpenCode 2.0.29 SSE payloads: `input.started` carries
       // {id, name}; the later tool events carry only {id} (plus assistantMessageID,
-      // input/text/content). `input.ended.text` is a JSON string of the arguments.
+      // input/text/content). `input.ended.text` is a JSON string of the arguments
+      // but is commonly empty, so the arguments come from `called.input`.
       case "session.tool.input.started":
         if (sid) {
           const name = typeof e.data?.name === "string" ? e.data.name : typeof e.data?.tool === "string" ? e.data.tool : "tool";
           if (e.data?.id != null) this.rememberToolName(sid, String(e.data.id), name);
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) this.handlers.onProgress(chatId, `preparing tool: ${name}`);
+          this.notifyProgress(sid, `preparing tool: ${name}`);
         }
         break;
       case "session.tool.input.ended":
@@ -181,10 +173,9 @@ export class Core {
           const id = e.data?.id != null ? String(e.data.id) : undefined;
           const name = this.resolveToolName(sid, e.data);
           this.rememberKnownToolName(sid, e.data, name);
-          const summary = this.summarizeToolInputText(e.data?.text);
+          const summary = this.describeToolInput(e.data?.text);
           if (id && summary) this.rememberToolInput(sid, id, summary);
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) this.handlers.onProgress(chatId, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
+          this.notifyProgress(sid, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
         }
         break;
       case "session.tool.called":
@@ -194,45 +185,40 @@ export class Core {
           this.rememberKnownToolName(sid, e.data, name);
           const summary = this.describeToolInput(e.data?.input) || (id ? this.toolInputFor(sid, id) : undefined) || "";
           if (id && summary) this.rememberToolInput(sid, id, summary);
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) this.handlers.onProgress(chatId, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
+          this.notifyProgress(sid, summary ? `tool: ${name} — ${summary}` : `tool: ${name}`);
         }
         break;
       case "session.tool.progress":
         if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) {
-            const name = this.resolveToolName(sid, e.data);
-            this.rememberKnownToolName(sid, e.data, name);
-            this.handlers.onProgress(chatId, `running tool: ${name}…`);
-          }
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          this.notifyProgress(sid, `running tool: ${name}…`);
         }
         break;
       case "session.tool.success":
         if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) {
-            const name = this.resolveToolName(sid, e.data);
-            this.rememberKnownToolName(sid, e.data, name);
-            this.handlers.onProgress(chatId, `completed tool: ${name}`);
-          }
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
+          this.notifyProgress(sid, `completed tool: ${name}`);
         }
         break;
       case "session.tool.failed":
       case "session.tool.error":
         if (sid) {
-          const chatId = this.sessionChat.get(sid);
-          if (chatId != null) {
-            const name = this.resolveToolName(sid, e.data);
-            const reason = typeof e.data?.error?.message === "string"
-              ? e.data.error.message
-              : typeof e.data?.error === "string"
-                ? e.data.error
-                : typeof e.data?.message === "string"
-                  ? e.data.message
+          // deliberately not rememberKnownToolName: a failed call must not seed a
+          // name that later events for the same id would then inherit
+          const name = this.resolveToolName(sid, e.data);
+          const error = e.data?.error;
+          const reason = typeof error?.message === "string"
+            ? error.message
+            : typeof error === "string"
+              ? error
+              : typeof e.data?.message === "string"
+                ? e.data.message
+                : error != null
+                  ? JSON.stringify(error)
                   : undefined;
-            this.handlers.onProgress(chatId, reason ? `tool failed: ${name} — ${redact(reason).slice(0, 160)}` : `tool failed: ${name}`);
-          }
+          this.notifyProgress(sid, reason ? `tool failed: ${name} — ${this.truncate(redact(reason))}` : `tool failed: ${name}`);
         }
         break;
       case "permission.asked":
@@ -258,6 +244,17 @@ export class Core {
     }
   }
 
+  /**
+   * Progress is only useful (and safe to display) while this bridge is waiting on
+   * the execution. A turn started from the OpenCode web UI/TUI would otherwise open
+   * a progress bubble that no terminal handler ever clears.
+   */
+  private notifyProgress(sid: string | undefined, text: string): void {
+    if (!sid || !this.pendingExecution.has(sid)) return;
+    const chatId = this.sessionChat.get(sid);
+    if (chatId != null) this.handlers.onProgress(chatId, text);
+  }
+
   private rememberToolName(sessionID: string, toolCallID: string, name: string): void {
     let names = this.toolNamesBySession.get(sessionID);
     if (!names) {
@@ -276,11 +273,18 @@ export class Core {
   /** Name for a lifecycle event: per-call id first, then event fields, then last seen. */
   private resolveToolName(sessionID: string, data: any): string {
     const id = data?.id != null ? String(data.id) : undefined;
-    return this.toolNameFor(sessionID, id)
+    const named = this.toolNameFor(sessionID, id)
       ?? (typeof data?.name === "string" ? data.name : undefined)
       ?? (typeof data?.tool === "string" ? data.tool : undefined)
-      ?? this.lastToolBySession.get(sessionID)
-      ?? "tool";
+      ?? this.lastToolBySession.get(sessionID);
+    if (named) return named;
+    if (!this.warnedUnnamedTool) {
+      this.warnedUnnamedTool = true;
+      console.warn(
+        `[tool event] no tool name for id=${id ?? "none"} in session ${sessionID}; using the generic "tool" — the event schema may have drifted`,
+      );
+    }
+    return "tool";
   }
 
   /**
@@ -309,11 +313,6 @@ export class Core {
   private toolInputFor(sessionID: string, toolCallID?: string): string | undefined {
     if (!toolCallID) return undefined;
     return this.toolInputsBySession.get(sessionID)?.get(toolCallID);
-  }
-
-  /** `input.ended.text` is a JSON string for structured tools; describeToolInput parses it. */
-  private summarizeToolInputText(text: unknown): string {
-    return typeof text === "string" ? this.describeToolInput(text) : "";
   }
 
   /**

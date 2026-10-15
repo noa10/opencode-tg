@@ -177,8 +177,18 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
 
   function clearProgress(chatId: number): void {
     const bubble = progressBubbles.get(chatId);
-    if (bubble?.flushTimer) clearTimeout(bubble.flushTimer);
+    if (!bubble) return;
+    if (bubble.flushTimer) clearTimeout(bubble.flushTimer);
     progressBubbles.delete(chatId);
+    // Remove the bubble so turns do not leave a stale "🔄 …" line behind. Wait for
+    // in-flight edits first, and for the create so a slow send is not orphaned.
+    void bubble.chain.then(() => {
+      const messageId = bubble.messageId;
+      if (messageId === undefined) return;
+      void bot.api.deleteMessage(chatId, messageId).catch((error: unknown) => {
+        console.error("progress cleanup failed", error);
+      });
+    });
   }
 
   function flushProgress(chatId: number): void {
@@ -196,11 +206,13 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
   function dispatchProgress(chatId: number, bubble: ProgressBubble, content: string): void {
     bubble.lastDispatch = Date.now();
     bubble.content = content;
-    const idAtDispatch = bubble.messageId;
     bubble.chain = bubble.chain.then(async () => {
-      if (idAtDispatch === undefined) return; // the create failed; there is no bubble to edit
+      // read the id at execution time: the create may still be in flight when a
+      // flush is queued, and the continuation only runs once it has settled
+      const messageId = bubble.messageId;
+      if (messageId === undefined) return; // the create failed; there is no bubble to edit
       try {
-        await bot.api.editMessageText(chatId, idAtDispatch, content, { parse_mode: "HTML" });
+        await bot.api.editMessageText(chatId, messageId, content, { parse_mode: "HTML" });
       } catch (error) {
         // editing to identical text is not an error for our throttle
         if (error instanceof GrammyError && error.error_code === 400 && error.description.includes("message is not modified")) return;
@@ -223,7 +235,13 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
       void bot.api
         .sendMessage(chatId, content, { parse_mode: "HTML" })
         .then((message) => { bubble.messageId = message.message_id; })
-        .catch((error: unknown) => console.error("progress message failed", error))
+        .catch((error: unknown) => {
+          console.error("progress message failed", error);
+          // Drop the dead entry so the next event can open a fresh bubble; keeping it
+          // would swallow every later progress line for the rest of the turn.
+          if (bubble.flushTimer) clearTimeout(bubble.flushTimer);
+          if (progressBubbles.get(chatId) === bubble) progressBubbles.delete(chatId);
+        })
         .finally(() => resolveCreated());
       return;
     }
