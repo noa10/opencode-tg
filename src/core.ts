@@ -89,6 +89,9 @@ export class Core {
   private lastToolBySession = new Map<string, string>();
   // sessionID -> tool call id -> redacted argument summary (learned from input.ended/called)
   private toolInputsBySession = new Map<string, Map<string, string>>();
+  // Tracks unknown session.tool.* event types we have already reported, so schema
+  // drift surfaces once rather than flooding the log on every turn.
+  private seenUnknownToolEventTypes = new Set<string>();
 
   constructor(
     private client: Client,
@@ -247,6 +250,9 @@ export class Core {
       default:
         if (e.type.startsWith("permission.") && e.type !== "permission.asked") {
           console.log(`[ignored permission event family] ${e.type}`);
+        } else if (e.type.startsWith("session.tool.") && !this.seenUnknownToolEventTypes.has(e.type)) {
+          this.seenUnknownToolEventTypes.add(e.type);
+          console.log(`[unknown tool event] ${e.type}`);
         }
         break;
     }
@@ -523,6 +529,7 @@ export class Core {
 
   async newSession(chatId: number): Promise<string> {
     const st = this.getState(chatId);
+    if (st.sessionID) this.clearToolState(st.sessionID);
     return this.createSession(chatId, st);
   }
 
@@ -690,6 +697,8 @@ export class Core {
     const session = response.data?.data;
     const directory = session?.location?.directory ? resolvePath(session.location.directory) : undefined;
     if (response.error || !session || !directory || !allowedDirectories.includes(directory)) return false;
+    const previousSessionID = this.getState(chatId).sessionID;
+    if (previousSessionID && previousSessionID !== sessionID) this.clearToolState(previousSessionID);
     this.setState(chatId, {
       ...this.getState(chatId),
       sessionID,
@@ -1032,6 +1041,7 @@ export class Core {
   setProject(chatId: number, projectDir: string) {
     const st = this.getState(chatId);
     if (st.projectDir === projectDir) return; // no-op: keep session/agent/model
+    if (st.sessionID) this.clearToolState(st.sessionID);
     this.setState(chatId, { projectDir });
   }
 
