@@ -296,6 +296,9 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
     },
     onProgress: throttleProgress,
     onDone: async (chatId, text) => {
+      // clear before sending: the answer send can be slow, and a queued turn that
+      // starts meanwhile must open its own bubble, not inherit and lose this one
+      clearProgress(chatId);
       const html = toTelegramHtml(redact(text));
       for (const part of chunk(html)) {
         try {
@@ -307,7 +310,6 @@ export async function makeBot(config: Config, core: Core, telegramApiFetch?: typ
           });
         }
       }
-      clearProgress(chatId);
     },
     onInterrupted: (chatId) => {
       clearProgress(chatId);

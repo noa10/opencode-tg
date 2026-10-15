@@ -16,6 +16,8 @@ const SECRET_PATTERNS: SecretPattern[] = [
   { re: /\b[0-9]{6,12}:[A-Za-z0-9_-]{30,}\b/g },
   // Bearer/Authorization header values and JWTs
   { re: /(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1[redacted]" },
+  // Basic auth header value (base64 "user:password")
+  { re: /(\bBasic\s+)[A-Za-z0-9+/=]{8,}/gi, replacement: "$1[redacted]" },
   { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g },
   // AWS access keys
   { re: /\bA[SK]IA[0-9A-Z]{16}\b/g },
@@ -27,10 +29,11 @@ const SECRET_PATTERNS: SecretPattern[] = [
   { re: /([?&](?:token|api[_-]?key|apikey|access[_-]?(?:key|token)|sig(?:nature)?|secret|password|credential|client[_-]?secret)=)[^&\s'"]+/gi, replacement: "$1[redacted]" },
   // KEY=value-style assignments in tool commands — keep the key, mask the value.
   // The lookahead avoids a second pass over already-redacted values and leaves
-  // "Authorization: Bearer …" to the bearer pattern above (which masks the token).
+  // "Authorization: Bearer/Basic …" to the header patterns above (which mask the token).
   { re: /(["']?\b[A-Za-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|authorization)[A-Za-z0-9_]*["']?\s*[=:]\s*["']?)(?!\[redacted\]|(?:Bearer|Basic)\b)[^\s"',;&}]{4,}/gi, replacement: "$1[redacted]" },
-  // --password-style flags, including suffixed names like --db-password
-  { re: /(--[A-Za-z0-9-]*(?:password|passwd|token|secret|api[-_]?key|apikey|credential)[A-Za-z0-9-]*\s+)(\S+)/gi, replacement: "$1[redacted]" },
+  // --password-style flags, including suffixed names like --db-password. The keyword
+  // must end the flag name so lookalikes like --tokenizer/--secret-scanner stay intact.
+  { re: /(--[A-Za-z0-9-]*(?:password|passwd|token|secret|api[-_]?key|apikey|credential)\b\s+)(\S+)/gi, replacement: "$1[redacted]" },
   // HTTP basic-auth flags: curl -u user:pass / --user user:pass
   { re: /((?:-u|--user)\s+[^\s:@]+:)(\S{4,})/gi, replacement: "$1[redacted]" },
   { re: /[A-Za-z0-9+/]{40,}={0,2}/g }, // generic long base64-ish blobs, last-resort, noisy — used sparingly below

@@ -163,8 +163,12 @@ export class Core {
       // but is commonly empty, so the arguments come from `called.input`.
       case "session.tool.input.started":
         if (sid) {
-          const name = typeof e.data?.name === "string" ? e.data.name : typeof e.data?.tool === "string" ? e.data.tool : "tool";
-          if (e.data?.id != null) this.rememberToolName(sid, String(e.data.id), name);
+          // Route through the shared resolver so a missing/renamed name field hits the
+          // drift warning, and only persist names that came from the event (or an
+          // already-mapped id) — the "tool" default must not poison the per-id or
+          // last-seen maps that later unnamed events depend on.
+          const name = this.resolveToolName(sid, e.data);
+          this.rememberKnownToolName(sid, e.data, name);
           this.notifyProgress(sid, `preparing tool: ${name}`);
         }
         break;

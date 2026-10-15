@@ -364,13 +364,35 @@ test("an unnamed tool event warns once about schema drift", () => {
     core.attach();
     core.sessionChat.set("session-1", USER_ID);
     watchSession(core, "session-1");
-    onEvent?.({ type: "session.tool.success", data: { sessionID: "session-1" } } as OcEvent);
-    onEvent?.({ type: "session.tool.success", data: { sessionID: "session-1" } } as OcEvent);
-    assert.deepEqual(progress, ["completed tool: tool", "completed tool: tool"]);
+    // input.started is the event whose missing name field is the likeliest drift
+    onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1" } } as OcEvent);
+    onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_2" } } as OcEvent);
+    assert.deepEqual(progress, ["preparing tool: tool", "preparing tool: tool"]);
   } finally {
     console.warn = originalWarn;
   }
   assert.equal(warnings.filter((warning) => warning.includes("no tool name")).length, 1, "the drift warning must not repeat");
+});
+
+test("an unnamed input.started does not poison the last-seen tool fallback", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  watchSession(core, "session-1");
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
+  // a name-less input.started must fall back for display but never store "tool"
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_2" } } as OcEvent);
+  assert.equal(progress.at(-1), "preparing tool: shell");
+  onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", error: { message: "boom" } } } as OcEvent);
+  assert.equal(progress.at(-1), "tool failed: shell — boom");
 });
 
 test("progress is not emitted for an execution the bridge is not watching", () => {

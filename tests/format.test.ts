@@ -36,10 +36,19 @@ test("redact masks credentials in connection URLs, basic auth, suffixed flags an
   }
 });
 
-test("redact does not double-mask a Bearer header and is stable under a second pass", () => {
-  const header = "Authorization: Bearer supersecrettoken123";
-  assert.equal(redact(header), "Authorization: Bearer [redacted]");
-  assert.equal(redact(redact(header)), redact(header), "a second redact pass must not change the output");
+test("redact masks Basic auth headers and does not double-mask Bearer/Basic values", () => {
+  const bearer = "Authorization: Bearer supersecrettoken123";
+  assert.equal(redact(bearer), "Authorization: Bearer [redacted]");
+  assert.equal(redact(redact(bearer)), redact(bearer), "a second redact pass must not change the output");
+  const basic = 'curl -H "Authorization: Basic YWRtaW46aHVudGVyMg==" https://api.example.com';
+  assert.doesNotMatch(redact(basic), /YWRtaW46aHVudGVyMg/);
+  assert.equal(redact("Authorization: Basic YWRtaW46aHVudGVyMg=="), "Authorization: Basic [redacted]");
+});
+
+test("redact leaves flags that merely contain a keyword untouched", () => {
+  for (const command of ["run --tokenizer fast", "pass --secret-scanner", "check --token-limit 10"]) {
+    assert.equal(redact(command), command, `${command} should not be masked`);
+  }
 });
 
 test("redact leaves benign text untouched", () => {
