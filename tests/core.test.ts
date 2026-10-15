@@ -251,7 +251,7 @@ test("truncated arguments fall back to the tool name instead of dumping raw JSON
   assert.doesNotMatch(progress.at(-1) ?? "", /questions/);
 });
 
-test("a tool failure without its call metadata still names the last tool", () => {
+test("a tool failure with an unmapped call id still names the last known tool", () => {
   let onEvent: ((event: OcEvent) => void) | undefined;
   const progress: string[] = [];
   const core = new Core(
@@ -264,7 +264,86 @@ test("a tool failure without its call metadata still names the last tool", () =>
   core.attach();
   core.sessionChat.set("session-1", USER_ID);
   onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_9", name: "question" } } as OcEvent);
-  // the failure arrives after a bridge restart, so the per-call id is unknown
+  // the failure arrives with an id the bridge never mapped (e.g. events buffered out of
+  // order), so the per-call lookup misses and the last reliably-named tool is used
   onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", error: { message: "Tool execution interrupted" } } } as OcEvent);
   assert.equal(progress.at(-1), "tool failed: question — Tool execution interrupted");
+});
+
+test("a guess from the last-seen fallback is never persisted as a tool name", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
+  // an unmapped call id resolves via the last-seen name but must NOT be stored under it —
+  // otherwise a real name arriving later for that id could not take over cleanly
+  onEvent?.({ type: "session.tool.called", data: { sessionID: "session-1", id: "call_2", input: { command: "ls" } } } as OcEvent);
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_2", name: "edit" } } as OcEvent);
+  onEvent?.({ type: "session.tool.failed", data: { sessionID: "session-1", id: "call_2", error: { message: "aborted" } } } as OcEvent);
+  assert.equal(progress.at(-1), "tool failed: edit — aborted");
+});
+
+test("progress lines redact secrets in tool arguments", () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const progress: string[] = [];
+  const core = new Core(
+    {} as unknown as Client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    { onPermission: () => {}, onProgress: (_c, text) => progress.push(text), onDone: () => {}, onError: () => {} },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  const command = 'curl -H "Authorization: Bearer supersecrettoken123" https://example.com/upload';
+  onEvent?.({ type: "session.tool.input.started", data: { sessionID: "session-1", id: "call_1", name: "shell" } } as OcEvent);
+  onEvent?.({ type: "session.tool.input.ended", data: { sessionID: "session-1", id: "call_1", text: JSON.stringify({ command }) } } as OcEvent);
+  onEvent?.({ type: "session.tool.called", data: { sessionID: "session-1", id: "call_1", input: { command } } } as OcEvent);
+  const line = progress.at(-1) ?? "";
+  assert.match(line, /\[redacted\]/);
+  assert.doesNotMatch(line, /supersecrettoken123/);
+});
+
+test("an interrupted turn ends with a plain interruption notice instead of an error", async () => {
+  let onEvent: ((event: OcEvent) => void) | undefined;
+  const notices: string[] = [];
+  const errors: string[] = [];
+  let prompted = false;
+  const client = {
+    GET: async () => ({ data: { data: [] }, error: undefined }),
+    POST: async () => {
+      prompted = true;
+      return { data: { data: true }, error: undefined, response: new Response(null, { status: 200 }) };
+    },
+  } as unknown as Client;
+  const core = new Core(
+    client,
+    { on: (callback: (event: OcEvent) => void) => { onEvent = callback; } } as unknown as EventBus,
+    () => ({ sessionID: "session-1", projectDir: "/repo" }),
+    () => {},
+    {
+      onPermission: () => {},
+      onProgress: () => {},
+      onDone: () => {},
+      onError: (_chatId, text) => errors.push(text),
+      onInterrupted: (chatId) => notices.push(String(chatId)),
+    },
+  );
+  core.attach();
+  core.sessionChat.set("session-1", USER_ID);
+  const done = core.sendPrompt(USER_ID, "work");
+  const deadline = Date.now() + 2000;
+  while (!prompted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  onEvent?.({ type: "session.execution.interrupted", data: { sessionID: "session-1" } } as OcEvent);
+  await done;
+  assert.deepEqual(notices, [String(USER_ID)], "an interrupt must reach the interruption notice");
+  assert.deepEqual(errors, [], "an interrupt must not be reported as an error");
 });

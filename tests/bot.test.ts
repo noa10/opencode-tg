@@ -128,3 +128,16 @@ test("an unknown slash command is not forwarded to the agent", async () => {
   assert.match(String(replies.at(-1)?.payload.text), /Unknown command/);
   assert.deepEqual(prompted, [], "the misspelled command must not become a prompt");
 });
+
+test("a burst of progress events creates one bubble and flushes the newest line", async () => {
+  const harness = await createHarness();
+  const progressSends = () =>
+    harness.calls.filter((call) => call.method === "sendMessage" && String(call.payload.text).startsWith("🔄")).length;
+  harness.handlers()?.onProgress(71, "step one");
+  harness.handlers()?.onProgress(71, "step two");
+  assert.equal(progressSends(), 1, "a burst must not create duplicate progress bubbles");
+  await new Promise((resolve) => setTimeout(resolve, 1400));
+  const edits = harness.calls.filter((call) => call.method === "editMessageText");
+  assert.equal(edits.length, 1, "the text dropped by the throttle must be flushed after the window");
+  assert.match(String(edits[0]?.payload.text), /step two/, "the flushed edit must carry the newest state");
+});
